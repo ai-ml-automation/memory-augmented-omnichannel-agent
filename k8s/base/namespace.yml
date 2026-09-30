@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: omnichannel
+  labels:
+    app.kubernetes.io/name: omnichannel
+    app.kubernetes.io/part-of: memory-augmented-agent

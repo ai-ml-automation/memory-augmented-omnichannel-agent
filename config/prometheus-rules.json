@@ -1,0 +1,64 @@
+{
+  "groups": [
+    {
+      "name": "omnichannel-alerts",
+      "rules": [
+        {
+          "alert": "HighLLMLatency",
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le)) > 5",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "LLM P95 > 5s"
+          }
+        },
+        {
+          "alert": "BackendHighLatency",
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 3",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Backend P95 > 3s"
+          }
+        },
+        {
+          "alert": "QdrantHighLatency",
+          "expr": "histogram_quantile(0.95, sum(rate(qdrant_search_duration_seconds_bucket[5m])) by (le)) > 2",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Qdrant P95 > 2s"
+          }
+        },
+        {
+          "alert": "BackendHighErrRate",
+          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m])) > 0.05",
+          "for": "5m",
+          "labels": {
+            "severity": "critical"
+          },
+          "annotations": {
+            "summary": "Backend 5xx rate > 5%"
+          }
+        },
+        {
+          "alert": "HighConflictRate",
+          "expr": "sum(rate(conflicts_detected_total{resolution=\"hitl_required\"}[1h])) > 10",
+          "for": "15m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Too many HITL conflicts"
+          }
+        }
+      ]
+    }
+  ]
+}

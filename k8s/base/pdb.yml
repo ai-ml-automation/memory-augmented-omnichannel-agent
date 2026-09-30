@@ -1,0 +1,15 @@
+# PodDisruptionBudget (IV.5)
+# Ensures at least 1 backend pod is always running during voluntary disruptions
+# (node drain, cluster upgrade, etc.).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: omnichannel
+  labels:
+    app: backend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: backend
