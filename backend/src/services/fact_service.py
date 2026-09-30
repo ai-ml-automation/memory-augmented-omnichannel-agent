@@ -1,16 +1,19 @@
 """
-Fact Service
-Storage and retrieval of facts in long-term memory.
+Сервис фактов: хранение и получение фактов долговременной памяти.
 
-Aligned with Fact model: type, value, weight, channel, created_at,
+Модель данных — Fact: type, value, weight, channel, created_at,
 expires_at, is_superseded.
 
-Security (Phase B):
-- value is AES-256-GCM encrypted before DB storage
-- consent check (152-FZ) enforced before all memory writes
+ПОЧЕМУ факты — отдельная сущность: сессии описывают «когда и откуда
+пришёл запрос», а факты — «что мы знаем о пользователе». Факты живут
+дольше сессий и переиспользуются всеми сценариями (чат, голос, поиск).
 
-Audit (Phase B.3.3):
-- All memory operations logged via AuditService (152-FZ)
+Безопасность (Phase B):
+- value шифруется AES-256-GCM перед записью в БД (B.1.2);
+- перед любой записью в память проверяется активное согласие 152-ФЗ (B.1.4).
+
+Аудит (Phase B.3.3):
+- все операции с памятью логируются через AuditService (152-ФЗ).
 """
 
 import logging
@@ -41,7 +44,15 @@ DEFAULT_EXPIRY_DAYS = 90
 
 
 class FactService:
-    """Service for managing facts in long-term memory."""
+    """
+    Сервис управления фактами долговременной памяти.
+
+    Единая точка CRUD-операций с фактами: создание, чтение, обновление
+    (supersede), удаление и поиск. Все публичные операции:
+    - проверяют активное согласие пользователя (152-ФЗ, II.1);
+    - логируют событие в аудит-журнал (B.3.3);
+    - возвращают значение факта расшифрованным (B.1.2).
+    """
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -51,10 +62,13 @@ class FactService:
     # ------------------------------------------------------------------
     async def _require_consent(self, user_id: uuid.UUID) -> None:
         """
-        Check that user has active consent (152-FZ).
+        Проверить наличие активного согласия пользователя (152-ФЗ).
+
+        ПОЧЕМУ: 152-ФЗ требует подтверждения согласия на обработку
+        ПДн перед любой операцией записи/чтения памяти (B.1.4, II.1).
 
         Raises:
-            PermissionError: If no active consent
+            PermissionError: Если активное согласие отсутствует
         """
         from backend.src.services.consent_service import ConsentService
 
@@ -76,16 +90,17 @@ class FactService:
         ip_address: str | None = None,
     ) -> None:
         """
-        Log an audit event for 152-FZ compliance.
+        Записать событие аудита для соответствия 152-ФЗ (B.3.3).
 
-        B.3.3: All memory operations are logged.
+        ПОЧЕМУ: все операции с памятью обязаны оставлять след — при
+        RTBF и проверках регулятора нужен полный журнал обращений.
 
         Args:
-            user_id: User identifier
-            action: Action type (READ, WRITE, DELETE)
-            fact_id: Related fact (optional)
-            source: Action source (AI, OPERATOR)
-            ip_address: Client IP (optional)
+            user_id: Идентификатор пользователя
+            action: Тип действия (READ, WRITE, DELETE)
+            fact_id: Связанный факт (необязательно)
+            source: Источник действия (AI, OPERATOR)
+            ip_address: IP-адрес клиента (необязательно)
         """
         from backend.src.services.audit_service import AuditService
 
@@ -107,19 +122,34 @@ class FactService:
     # ------------------------------------------------------------------
     @staticmethod
     def _encrypt_value(plaintext: str) -> str:
-        """Encrypt fact value before storage."""
+        """
+        Зашифровать значение факта перед записью в БД (B.1.2).
+
+        Обёртка над utils.crypto.encrypt: единая точка вызова, чтобы
+        логика шифрования не дублировалась по сервису.
+        """
         return encrypt(plaintext)
 
     @staticmethod
     def _decrypt_value(ciphertext: str) -> str:
-        """Decrypt fact value after retrieval."""
+        """
+        Расшифровать значение факта после чтения (B.1.2).
+
+        ПОЧЕМУ fallback: старые или не-ПДн значения могут лежать
+        открытым текстом — is_encrypted отличает их от шифротекста.
+        """
         if is_encrypted(ciphertext):
             return decrypt(ciphertext)
         # Fallback: value is not encrypted (legacy or non-PII data)
         return ciphertext
 
     def _decrypt_fact(self, fact: Fact) -> Fact:
-        """Decrypt a single fact's value in-place (returns the same object)."""
+        """
+        Расшифровать значение одного факта на месте (in-place).
+
+        ПОЧЕМУ возвращает тот же объект: вызывающий код успевает
+        работать с Fact до повторной сериализации, без копий.
+        """
         if fact.value:
             fact.value = self._decrypt_value(fact.value)
         return fact
@@ -137,28 +167,23 @@ class FactService:
         expires_in_days: int = DEFAULT_EXPIRY_DAYS,
     ) -> Fact:
         """
-        Store a new fact.
-
-        1. Validates fact type
-        2. Checks active consent (152-FZ)
-        3. Encrypts value (AES-256-GCM)
-        4. Persists to DB
-        5. Logs audit (WRITE)
+        Сохранить новый факт: валидация типа → согласие (152-ФЗ,
+        B.1.4) → шифрование (AES-256-GCM, B.1.2) → запись в БД.
 
         Args:
-            user_id: User identifier
-            fact_type: One of VALID_FACT_TYPES
-            value: Fact content text (will be encrypted)
-            channel: Source channel (MAX, TG, VK, VOICE)
-            weight: Importance weight (0.0 to 1.0)
-            expires_in_days: Days until auto-expiry
+            user_id: Идентификатор пользователя
+            fact_type: Один из VALID_FACT_TYPES
+            value: Текст факта (будет зашифрован)
+            channel: Канал-источник (MAX, TG, VK, VOICE)
+            weight: Вес важности (0.0–1.0)
+            expires_in_days: Дней до авто-протухания
 
         Returns:
-            Created Fact instance (with decrypted value)
+            Созданный Fact (значение расшифровано)
 
         Raises:
-            ValueError: If fact_type is not valid
-            PermissionError: If user has no active consent
+            ValueError: Некорректный fact_type
+            PermissionError: Нет активного согласия (152-ФЗ)
         """
         if fact_type not in VALID_FACT_TYPES:
             raise ValueError(
@@ -217,23 +242,23 @@ class FactService:
         limit: int = 100,
     ) -> list[Fact]:
         """
-        Get facts for user (values are decrypted on retrieval).
+        Получить факты пользователя (значения расшифровываются).
 
-        152-FZ: Active consent is required before reading facts.
-        B.3.3: Logs a READ audit event.
+        Чтение требует активного согласия (152-ФЗ §7.1, II.1) и
+        логируется как READ (B.3.3) — даже если фактов не найдено.
 
         Args:
-            user_id: User identifier
-            fact_type: Optional type filter
-            active_only: Exclude superseded facts
-            min_weight: Minimum weight threshold
-            limit: Maximum number of facts
+            user_id: Идентификатор пользователя
+            fact_type: Фильтр по типу (необязательно)
+            active_only: Исключить superseded-факты
+            min_weight: Минимальный порог веса
+            limit: Максимум фактов
 
         Returns:
-            List of Fact instances with decrypted values
+            Список Fact с расшифрованными значениями
 
         Raises:
-            PermissionError: If user has no active consent (152-FZ)
+            PermissionError: Нет активного согласия (152-ФЗ)
         """
         # II.1: consent check on READ (152-FZ §7.1)
         await self._require_consent(user_id)
@@ -263,19 +288,19 @@ class FactService:
         fact_id: uuid.UUID,
     ) -> Fact | None:
         """
-        Get fact by ID (value decrypted).
+        Получить факт по ID (значение расшифровано).
 
-        152-FZ: Active consent is required before reading facts.
-        B.3.3: Logs a READ audit event.
+        Согласие проверяется по владельцу факта, а не по переданному
+        ID — защита от чтения чужих фактов (152-ФЗ §7.1, II.1).
 
         Args:
-            fact_id: Fact identifier
+            fact_id: Идентификатор факта
 
         Returns:
-            Fact instance with decrypted value, or None
+            Fact с расшифрованным значением, или None
 
         Raises:
-            PermissionError: If user has no active consent (152-FZ)
+            PermissionError: Нет активного согласия (152-ФЗ)
         """
         result = await self.db.execute(
             select(Fact).where(Fact.id == fact_id)
@@ -299,19 +324,20 @@ class FactService:
         fact_id: uuid.UUID,
     ) -> bool:
         """
-        Mark a fact as superseded (replaced by newer data).
+        Пометить факт как замещённый (superseded) новыми данными.
 
-        152-FZ: Active consent is required before modifying facts.
-        B.3.3: Logs a WRITE audit event.
+        История сохраняется, а не перезаписывается: вес падает до
+        0.1, факт исключается из выборок active_only, но остаётся
+        в БД для аудита и отката (152-ФЗ, B.3.3).
 
         Args:
-            fact_id: Fact identifier
+            fact_id: Идентификатор факта
 
         Returns:
-            True if superseded
+            True, если факт помечен
 
         Raises:
-            PermissionError: If user has no active consent (152-FZ)
+            PermissionError: Нет активного согласия (152-ФЗ)
         """
         fact = await self._get_fact_raw(fact_id)
         if not fact:
@@ -338,19 +364,19 @@ class FactService:
         fact_id: uuid.UUID,
     ) -> bool:
         """
-        Hard-delete a fact (used by RightToBeForgotten).
+        Жёстко удалить факт (используется RightToBeForgotten).
 
-        152-FZ: Active consent is required before deleting facts.
-        B.3.3: Logs a DELETE audit event.
+        Аудит DELETE пишется ДО удаления: после удаления события в
+        журнале ссылаются на удалённый id, но сохраняют след (B.3.3).
 
         Args:
-            fact_id: Fact identifier
+            fact_id: Идентификатор факта
 
         Returns:
-            True if deleted
+            True, если факт удалён
 
         Raises:
-            PermissionError: If user has no active consent (152-FZ)
+            PermissionError: Нет активного согласия (152-ФЗ)
         """
         fact = await self._get_fact_raw(fact_id)
         if not fact:
@@ -378,26 +404,23 @@ class FactService:
         limit: int = 10,
     ) -> list[Fact]:
         """
-        Search facts by value text.
+        Найти факты по тексту значения.
 
-        NOTE: LIKE search does not work on encrypted data.
-        This method retrieves all active facts and performs
-        in-memory search on decrypted values.
-        For production, use VectorStoreService (Qdrant) instead.
-
-        152-FZ: Active consent is required before reading/searching facts.
-        B.3.3: Logs a READ audit event.
+        ПОЧЕМУ in-memory: LIKE-поиск не работает на шифрованных
+        данных — метод тянет активные факты (до 500) и фильтрует
+        по расшифрованным значениям. Для продакшена используйте
+        VectorStoreService (Qdrant).
 
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
+            user_id: Идентификатор пользователя
+            query: Поисковый запрос
+            limit: Максимум результатов
 
         Returns:
-            Matching facts with decrypted values
+            Подходящие факты с расшифрованными значениями
 
         Raises:
-            PermissionError: If user has no active consent (152-FZ)
+            PermissionError: Нет активного согласия (152-ФЗ)
         """
         # II.1: consent check on READ (152-FZ §7.1)
         await self._require_consent(user_id)
@@ -432,18 +455,19 @@ class FactService:
         user_id: uuid.UUID,
     ) -> dict[str, int]:
         """
-        Get fact statistics for user.
+        Статистика фактов пользователя.
 
-        152-FZ: Active consent is required before reading fact data.
+        Считаются только активные факты (не superseded); чтение
+        требует активного согласия (152-ФЗ, II.1).
 
         Args:
-            user_id: User identifier
+            user_id: Идентификатор пользователя
 
         Returns:
-            Statistics dict with counts per type
+            Словарь с количеством фактов по каждому типу
 
         Raises:
-            PermissionError: If user has no active consent (152-FZ)
+            PermissionError: Нет активного согласия (152-ФЗ)
         """
         # II.1: consent check (152-FZ §7.1)
         await self._require_consent(user_id)
@@ -470,7 +494,12 @@ class FactService:
     # Internal helpers
     # ------------------------------------------------------------------
     async def _get_fact_raw(self, fact_id: uuid.UUID) -> Fact | None:
-        """Get fact without decryption (for internal mutations)."""
+        """
+        Получить факт без расшифровки (для внутренних мутаций).
+
+        ПОЧЕМУ: мутации (supersede/delete) не читают значение —
+        расшифровка была бы лишней работой и риском для ПДн.
+        """
         result = await self.db.execute(
             select(Fact).where(Fact.id == fact_id)
         )

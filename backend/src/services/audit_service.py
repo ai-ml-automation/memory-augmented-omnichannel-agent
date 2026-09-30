@@ -1,6 +1,9 @@
 """
-Audit Service
-152-FZ compliance: audit logging
+Сервис аудит-лога (152-ФЗ).
+
+Фиксирует действия с ПДн: кто (user_id), что (action: READ/WRITE/DELETE),
+откуда (source: AI/OPERATOR) и когда. Хранится в AuditLog без возможности
+перезаписи — цепочка неизменяемых записей для проверок регулятора.
 """
 
 import uuid
@@ -13,7 +16,12 @@ from backend.src.models import AuditLog
 
 
 class AuditService:
-    """Service for audit logging (152-FZ)."""
+    """
+    Сервис журналирования действий с ПДн (152-ФЗ).
+
+    Единая точка записи: все операции чтения/изменения/удаления данных
+    пользователя логируются здесь, чтобы аудит-след был полным.
+    """
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -27,17 +35,17 @@ class AuditService:
         ip_address: str | None = None,
     ) -> AuditLog:
         """
-        Log an audit action.
+        Запись одного аудит-события.
 
+        id и timestamp генерируются здесь (не в БД): сервис не зависит от
+        диалекта БД и может писать в любую сессию.
         Args:
-            user_id: User identifier
-            action: Action type (READ, WRITE, DELETE)
-            source: Action source (AI, OPERATOR)
-            fact_id: Related fact identifier (optional)
-            ip_address: Client IP address (optional)
-
+            user_id: идентификатор пользователя
+            action: тип действия (READ, WRITE, DELETE)
+            source: источник (AI, OPERATOR)
+            fact_id, ip_address: опционально — факт и IP клиента
         Returns:
-            Created AuditLog instance
+            созданная запись AuditLog
         """
         audit_log = AuditLog(
             id=uuid.uuid4(),
@@ -59,14 +67,14 @@ class AuditService:
         limit: int = 100,
     ) -> list[AuditLog]:
         """
-        Get audit logs for user.
+        Лог действий пользователя, новые записи первыми.
 
+        limit защищает от выгрузки всей истории: выдача ограничена пагинацией.
         Args:
-            user_id: User identifier
-            limit: Maximum number of logs
-
+            user_id: идентификатор пользователя
+            limit: максимальное число записей
         Returns:
-            List of AuditLog instances
+            список AuditLog (новые сверху)
         """
         result = await self.db.execute(
             select(AuditLog)
@@ -81,13 +89,13 @@ class AuditService:
         fact_id: uuid.UUID,
     ) -> list[AuditLog]:
         """
-        Get audit logs for specific fact.
+        Лог действий по конкретному факту (новые сверху).
 
+        Используется для проверки: кто и когда читал/менял конкретный факт.
         Args:
-            fact_id: Fact identifier
-
+            fact_id: идентификатор факта
         Returns:
-            List of AuditLog instances
+            список AuditLog по факту
         """
         result = await self.db.execute(
             select(AuditLog)

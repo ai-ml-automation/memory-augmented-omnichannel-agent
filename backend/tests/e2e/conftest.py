@@ -1,7 +1,10 @@
 """
-E2E Test Configuration
-Supports both SQLite (local) and PostgreSQL (CI) backends.
-When DATABASE_URL env var is set, uses real PostgreSQL for accurate JSONB/UUID testing.
+Конфигурация E2E-тестов: жизненный цикл приложения и БД.
+
+Поддерживает SQLite (локально) и PostgreSQL (CI): при заданном
+DATABASE_URL используется реальный PG для точного JSONB/UUID.
+Тяжёлые опциональные зависимости (opentelemetry, prometheus и др.)
+подменяются моками ДО импорта main — иначе тесты требуют их установки.
 """
 
 import asyncio
@@ -51,15 +54,30 @@ if not IS_POSTGRESQL:
 
     @compiles(PG_UUID, "sqlite")
     def compile_uuid_sqlite(type_, compiler, **kw):
+        """Компилирует PG UUID в VARCHAR(36) для SQLite-бэкенда.
+
+        Без этого объявления create_all падает: SQLite не знает
+        тип UUID; 36 символов совпадают с форматом канонического UUID.
+        """
         return "VARCHAR(36)"
 
     @compiles(PG_JSONB, "sqlite")
     def compile_jsonb_sqlite(type_, compiler, **kw):
+        """Компилирует PG JSONB в TEXT для SQLite-бэкенда.
+
+        SQLite хранит JSON как текст; сравнение/сериализация
+        остаются на уровне SQLAlchemy-типов.
+        """
         return "TEXT"
 
 
 @pytest.fixture(scope="session")
 def event_loop():
+    """Возвращает единый event loop на всю e2e-сессию.
+
+    Ловит конфликт циклов: pytest-asyncio требует стабильный loop
+    между корутинными фикстурами и тестами.
+    """
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
@@ -67,6 +85,11 @@ def event_loop():
 
 @pytest_asyncio.fixture(scope="function")
 async def db_engine():
+    """Создаёт движок БД и разворачивает схему на время теста.
+
+    Для SQLite включает PRAGMA foreign_keys=ON (иначе каскадные
+    ограничения молча игнорируются); после теста — drop_all и dispose.
+    """
     engine_kwargs: dict = {"echo": False}
     if IS_POSTGRESQL:
         engine_kwargs.update(
@@ -79,6 +102,11 @@ async def db_engine():
     if not IS_POSTGRESQL:
         @event.listens_for(engine.sync_engine, "connect")
         def set_sqlite_pragma(dbapi_connection, connection_record):
+            """Включает проверку внешних ключей на каждом соединении.
+
+            По умолчанию SQLite отключает FK-ограничения; без PRAGMA
+            тесты каскадного удаления (RTBF) молча проходят мимо багов.
+            """
             cursor = dbapi_connection.cursor()
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.close()
@@ -96,6 +124,15 @@ async def db_engine():
 
 @pytest_asyncio.fixture(scope="function")
 async def db_session(db_engine) -> AsyncGenerator[AsyncSession, None]:
+    """Открывает изолированную сессию БД для каждого теста.
+
+    Args:
+        db_engine: движок из одноимённой фикстуры.
+
+    Yields:
+        AsyncSession: сессия с expire_on_commit=False; после теста
+        выполняется rollback для сброса незакоммиченных изменений.
+    """
     session_factory = async_sessionmaker(
         bind=db_engine,
         class_=AsyncSession,
@@ -108,7 +145,15 @@ async def db_session(db_engine) -> AsyncGenerator[AsyncSession, None]:
 
 @pytest_asyncio.fixture(scope="function")
 async def client(db_engine) -> AsyncGenerator[AsyncClient, None]:
-    """Async HTTP client for E2E tests."""
+    """Возвращает HTTP-клиент к приложению с переопределённой БД.
+
+    Args:
+        db_engine: движок из одноимённой фикстуры.
+
+    Yields:
+        AsyncClient: клиент поверх ASGITransport; get_db подменён,
+        чтобы запросы шли в тестовую БД, а не в продовую.
+    """
     session_factory = async_sessionmaker(
         bind=db_engine,
         class_=AsyncSession,

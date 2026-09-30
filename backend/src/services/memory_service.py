@@ -1,9 +1,9 @@
 """
-Memory Service
-Abstract base class for memory operations (Phase C.1.1).
+Сервис памяти: абстрактный базовый класс операций памяти (Phase C.1.1).
 
-Defines the unified interface that concrete implementations
-(e.g. Mem0MemoryService) must satisfy.
+ПОЧЕМУ ABC: единый интерфейс гарантирует, что любая конкретная
+реализация (Mem0MemoryService и т.п.) поддерживает один и тот же
+набор операций — вызывающий код не зависит от хранилища.
 """
 
 import abc
@@ -13,7 +13,13 @@ from typing import Any
 
 
 class MemoryService(abc.ABC):
-    """Abstract memory service interface (Phase C.1.1)."""
+    """
+    Абстрактный интерфейс сервиса памяти (Phase C.1.1).
+
+    Методы: store_fact, retrieve_facts, search_facts, delete_user_data
+    (RTBF), get_memory_context. Конкретные реализации обязаны
+    реализовать все абстрактные методы.
+    """
 
     @abc.abstractmethod
     async def store_fact(
@@ -24,7 +30,12 @@ class MemoryService(abc.ABC):
         channel: str,
         weight: float = 1.0,
     ) -> Any:
-        """Store a fact in memory."""
+        """
+        Сохранить факт в памяти.
+
+        Аргументы соответствуют FactService.store_fact; конкретная
+        реализация решает, какие хранилища задействовать.
+        """
         ...
 
     @abc.abstractmethod
@@ -34,7 +45,12 @@ class MemoryService(abc.ABC):
         query: str = "",
         limit: int = 10,
     ) -> list[Any]:
-        """Retrieve facts from memory."""
+        """
+        Получить факты из памяти.
+
+        query необязателен: пустая строка возвращает последние факты
+        пользователя, не выполняя поиск (см. FactService.get_facts).
+        """
         ...
 
     @abc.abstractmethod
@@ -44,12 +60,22 @@ class MemoryService(abc.ABC):
         query: str,
         limit: int = 10,
     ) -> list[Any]:
-        """Search facts by text."""
+        """
+        Найти факты по тексту.
+
+        Отличие от retrieve_facts: всегда выполняется поиск по
+        содержимому, а не просто выборка последних фактов.
+        """
         ...
 
     @abc.abstractmethod
     async def delete_user_data(self, user_id: uuid.UUID) -> dict[str, Any]:
-        """Delete all user data (RTBF)."""
+        """
+        Удалить все данные пользователя (RTBF, 152-ФЗ).
+
+        Обязателен для соответствия 152-ФЗ: вызывается при отзыве
+        согласия и по запросу пользователя на удаление.
+        """
         ...
 
     @abc.abstractmethod
@@ -59,5 +85,10 @@ class MemoryService(abc.ABC):
         current_message: str,
         max_facts: int = 5,
     ) -> str:
-        """Get memory context string for LLM prompt."""
+        """
+        Сформировать контекст памяти для промпта LLM.
+
+        Возвращает строку с релевантными фактами — подставляется в
+        промпт, чтобы модель учитывала память о пользователе.
+        """
         ...

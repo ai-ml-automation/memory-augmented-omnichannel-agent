@@ -1,9 +1,12 @@
 """
-Integration tests for vector store embeddings (Phase D.1).
+Интеграционные тесты vector store эмбеддингов (Phase D.1).
 
-Mocks heavy libraries (sentence_transformers, qdrant_client) via
-sys.modules BEFORE importing VectorStoreService, so tests run without
-torch/sentence-transformers installed.
+Подменяют тяжёлые библиотеки (sentence_transformers, qdrant_client)
+через sys.modules ДО импорта VectorStoreService, поэтому тесты
+работают без установленных torch/sentence-transformers и без
+реального Qdrant. Проверяют контракт сервиса: реальный вызов encode
+с normalize_embeddings, передачу query_vector в поиск, ленивую
+загрузку модели.
 """
 
 import sys
@@ -14,6 +17,12 @@ import pytest
 
 
 def _make_fake_modules():
+    """Создаёт полный набор моков sentence_transformers и qdrant_client.
+
+    Returns:
+        (mock_model, mock_client, fake_st, fake_qdrant): модель с encode
+        (возвращает вектор 384), клиент Qdrant, фейковые модули.
+    """
     mock_model = MagicMock()
     mock_embedding = [0.1] * 384
     mock_model.encode.return_value = MagicMock(
@@ -32,6 +41,15 @@ def _make_fake_modules():
 
 
 def _install_fake_modules(fake_st, fake_qdrant):
+    """Собирает словарь подмены sys.modules для импорта сервиса.
+
+    Args:
+        fake_st: фейковый модуль sentence_transformers.
+        fake_qdrant: фейковый модуль qdrant_client.
+
+    Returns:
+        dict: карта «имя модуля → мок» для patch.dict(sys.modules, ...).
+    """
     fake = {
         "sentence_transformers": fake_st,
         "qdrant_client": fake_qdrant,
@@ -43,9 +61,21 @@ def _install_fake_modules(fake_st, fake_qdrant):
 
 
 class TestVectorStoreEmbeddings:
+    """Группа тестов контракта VectorStoreService на фейках зависимостей.
+
+    Покрывают реальный вызов encode (index_fact), передачу
+    query_vector в поиск (search_similar) и ленивую загрузку модели
+    (get_embedding). Тяжёлые библиотеки подменены через sys.modules.
+    """
 
     @pytest.mark.asyncio
     async def test_index_fact_generates_real_embedding(self):
+        """Ловит отключение реального эмбеддинга: факт индексируется «вхолостую».
+
+        index_fact обязан вызвать encode с normalize_embeddings=True
+        и отправить upsert в Qdrant; иначе векторный поиск
+        возвращает пустоту (Phase D.1).
+        """
         mock_model, mock_client, fake_st, fake_qdrant = _make_fake_modules()
         fake_modules = _install_fake_modules(fake_st, fake_qdrant)
 
@@ -76,6 +106,12 @@ class TestVectorStoreEmbeddings:
 
     @pytest.mark.asyncio
     async def test_search_similar_uses_real_query_embedding(self):
+        """Ловит поиск без эмбеддинга запроса: query_vector теряется.
+
+        search_similar обязан закодировать запрос и передать вектор
+        в search; без этого поиск по смыслу вырождается в пустой
+        результат (Phase D.1).
+        """
         mock_model, mock_client, fake_st, fake_qdrant = _make_fake_modules()
 
         mock_point = MagicMock()
@@ -118,6 +154,11 @@ class TestVectorStoreEmbeddings:
 
     @pytest.mark.asyncio
     async def test_embedding_lazy_loading(self):
+        """Ловит жадную загрузку модели: SentenceTransformer создаётся рано.
+
+        Модель должна создаваться только при первом запросе эмбеддинга
+        (лениво) — при старте приложения тяжёлая загрузка недопустима.
+        """
         mock_model, mock_client, fake_st, fake_qdrant = _make_fake_modules()
         fake_modules = _install_fake_modules(fake_st, fake_qdrant)
 

@@ -1,8 +1,13 @@
 """
 Unit Tests for VoiceService (Phase C.3.3)
 
-Pure-mock tests -- verifies ASR -> Memory -> LLM -> TTS pipeline
-and graceful handling of failures at each stage.
+Pure-mock тесты конвейера голосового канала:
+ASR → поиск памяти → LLM → TTS и graceful handling сбоев на каждом звене.
+
+Зачем pure-mock: проверяют оркестрацию голосового диалога без реальных
+SpeechService/LLM — отключение голосового канала через ENABLE_VOICE,
+короткое замыкание при ошибке распознавания, полный конвейер с передачей
+контекста памяти и параметров синтеза речи.
 """
 
 import uuid
@@ -23,13 +28,19 @@ _active_settings_patcher = None
 
 
 def _make_svc(enable_voice: bool = True):
-    """Create VoiceService with all internal services mocked.
+    """Создать VoiceService со всеми внутренними сервисами-моками.
 
-    The settings patch is started (not context-managed) so that it persists
-    beyond _make_svc — the service's ``process_voice`` method reads the
-    module-level ``settings`` variable at call time, not construction time.
-    The caller is responsible for stopping the patcher when done, or a
-    subsequent ``_make_svc`` call will stop the previous one automatically.
+    Патч settings запускается без context-manager (persistent), потому что
+    process_voice читает модульную переменную settings в момент вызова,
+    а не при конструировании. Caller обязан остановить patcher, либо
+    следующий вызов _make_svc остановит предыдущий автоматически.
+
+    Args:
+        enable_voice: значение ENABLE_VOICE для мок-настроек.
+
+    Returns:
+        кортеж (VoiceService, mock_settings): сервис с замоканными
+        speech_service/memory_search/llm_service и сами мок-настройки.
     """
     global _active_settings_patcher
 
@@ -68,11 +79,20 @@ def _make_svc(enable_voice: bool = True):
 
 
 class TestProcessVoice:
-    """Tests for VoiceService.process_voice."""
+    """Группа тестов process_voice: конвейер ASR → память → LLM → TTS.
+
+    Покрывают выключенный голосовой канал, короткое замыкание при сбое
+    распознавания и полный конвейер с передачей контекста памяти.
+    """
 
     @pytest.mark.asyncio
     async def test_process_voice_disabled_returns_error(self):
-        """When ENABLE_VOICE is False, returns error immediately."""
+        """Ловит баг, если при ENABLE_VOICE=False канал не отключается.
+
+        process_voice обязан сразу вернуть success=False с ошибкой,
+        содержащей "disabled", и не трогать SpeechService/LLM. Пропуск
+        проверки флага приведёт к попытке синтеза без провайдера.
+        """
         svc, _settings = _make_svc(enable_voice=False)
 
         result = await svc.process_voice(
@@ -85,7 +105,12 @@ class TestProcessVoice:
 
     @pytest.mark.asyncio
     async def test_process_voice_asr_failure(self):
-        """ASR returning success=False short-circuits the pipeline."""
+        """Ловит баг, если сбой ASR не прерывает конвейер.
+
+        При success=False из speech_to_text сервис обязан вернуть ошибку
+        и НЕ вызывать ни поиск памяти, ни LLM. Продолжение конвейера
+        после сбоя распознавания даст ответ на пустой/битый текст.
+        """
         svc, _settings = _make_svc(enable_voice=True)
 
         svc.speech_service.speech_to_text = AsyncMock(
@@ -105,7 +130,14 @@ class TestProcessVoice:
 
     @pytest.mark.asyncio
     async def test_process_voice_full_pipeline(self):
-        """Full pipeline: ASR -> memory search -> LLM -> TTS."""
+        """Ловит баг, если полный голосовой конвейер теряет звено.
+
+        Проверяет всю цепочку: распознанный текст уходит в поиск памяти
+        (user_id, current_message, max_facts=3), промпт LLM содержит
+        контекст памяти и текст запроса (max_tokens=500), а TTS вызывается
+        с ответом, голосом "alena" и speed=1.0. Результат агрегирует
+        текст, аудио, confidence и пустой error.
+        """
         svc, _settings = _make_svc(enable_voice=True)
 
         # 1. ASR

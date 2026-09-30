@@ -1,6 +1,10 @@
 """
-Celery Application
-Configured with Redis broker for async task processing.
+Настройка Celery для асинхронных фоновых задач.
+
+Брокер/бэкенд — Redis (URL из Settings); JSON-сериализация задач;
+task_acks_late + worker_prefetch_multiplier=1 дают at-least-once (задача
+не теряется при падении воркера). beat_schedule каждый час запускает
+агента затухания памяти (decay-agent-hourly → run_decay_agent).
 """
 
 from celery import Celery

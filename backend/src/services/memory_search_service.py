@@ -1,9 +1,10 @@
 """
-Memory Search Service
-Combined search across facts, vectors, and graph.
+Сервис гибридного поиска по памяти: факты (PostgreSQL), векторы
+(Qdrant) и граф (Neo4j) в едином интерфейсе.
 
-III.3: Optional Cross-Encoder re-ranking for improved relevance.
-γ.1: Preload Cross-Encoder at startup to eliminate cold start latency.
+III.3: опциональный реранжировщик Cross-Encoder для релевантности.
+γ.1: модель загружается лениво в thread pool, чтобы не блокировать
+event loop при холодном старте.
 """
 
 import asyncio
@@ -24,13 +25,16 @@ settings = get_settings()
 
 class MemorySearchService:
     """
-    Unified memory search service.
+    Единый сервис поиска по памяти.
 
-    Combines:
-    - Keyword search (PostgreSQL)
-    - Semantic search (Qdrant vectors)
-    - Graph traversal (Neo4j)
-    - III.3: Cross-Encoder re-ranking (optional, when ENABLE_LLM=True)
+    Комбинирует стратегии:
+    - keyword: текстовый поиск (PostgreSQL, in-memory по расшифровке);
+    - vector: семантический поиск (Qdrant);
+    - graph: обход графа знаний (Neo4j);
+    - hybrid: объединение всех стратегий + реранжирование (III.3).
+
+    ПОЧЕМУ гибрид: каждая стратегия видит свой срез памяти — ключевые
+    слова точны, векторы ловят синонимы, граф находит связанные факты.
     """
 
     def __init__(self, db: AsyncSession):
@@ -41,9 +45,11 @@ class MemorySearchService:
         self._ranker = None
 
     async def _get_ranker(self) -> Any:
-        """Lazy initialization of Cross-Encoder ranker (III.3, γ.1).
+        """
+        Ленивая инициализация Cross-Encoder реранжировщика (III.3, γ.1).
 
-        Loads the model in a thread pool to avoid blocking the event loop.
+        Модель загружается в thread pool, чтобы не блокировать event
+        loop; при недоступности помечается False и поиск идёт без реранга.
         """
         if self._ranker is None:
             if not settings.ENABLE_LLM:
@@ -74,16 +80,19 @@ class MemorySearchService:
         limit: int = 10,
     ) -> dict[str, Any]:
         """
-        Search memory using specified strategy.
+        Поиск по памяти выбранной стратегией.
+
+        Стратегия задаёт, какие хранилища опрашиваются: keyword,
+        vector, graph или hybrid (все три + реранжирование).
 
         Args:
-            user_id: User identifier
-            query: Search query
-            search_type: Search type (keyword, vector, graph, hybrid)
-            limit: Maximum results
+            user_id: Идентификатор пользователя
+            query: Поисковый запрос
+            search_type: Тип поиска (keyword, vector, graph, hybrid)
+            limit: Максимум результатов
 
         Returns:
-            Search results with metadata
+            Результаты поиска с метаданными
         """
         results = {
             "query": query,
@@ -113,15 +122,18 @@ class MemorySearchService:
         limit: int,
     ) -> list[dict[str, Any]]:
         """
-        Keyword search in PostgreSQL.
+        Текстовый поиск по PostgreSQL (через FactService.search_facts).
+
+        ПОЧЕМУ in-memory: значения хранятся зашифрованными (B.1.2),
+        поэтому поиск идёт по расшифрованным данным в памяти.
 
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
+            user_id: Идентификатор пользователя
+            query: Поисковый запрос
+            limit: Максимум результатов
 
         Returns:
-            Matching facts
+            Найденные факты
         """
         facts = await self.fact_service.search_facts(user_id, query, limit)
 
@@ -144,15 +156,18 @@ class MemorySearchService:
         limit: int,
     ) -> list[dict[str, Any]]:
         """
-        Semantic vector search in Qdrant.
+        Семантический поиск по векторам в Qdrant.
+
+        ПОЧЕМУ пустой результат при ENABLE_LLM=False: эмбеддинги
+        требуют LLM-модели, без неё векторный поиск невозможен.
 
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
+            user_id: Идентификатор пользователя
+            query: Поисковый запрос
+            limit: Максимум результатов
 
         Returns:
-            Similar facts with scores
+            Похожие факты с оценками
         """
         if not settings.ENABLE_LLM:
             return []
@@ -185,15 +200,18 @@ class MemorySearchService:
         limit: int,
     ) -> list[dict[str, Any]]:
         """
-        Graph-based search in Neo4j.
+        Поиск по графу знаний в Neo4j.
+
+        Обход глубины 2 (связи фактов пользователя), фильтрация узлов
+        по вхождению query в summary узла типа Fact.
 
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
+            user_id: Идентификатор пользователя
+            query: Поисковый запрос
+            limit: Максимум результатов
 
         Returns:
-            Related facts from graph
+            Связанные факты из графа
         """
         if not settings.ENABLE_LLM:
             return []
@@ -233,15 +251,19 @@ class MemorySearchService:
         limit: int,
     ) -> list[dict[str, Any]]:
         """
-        Hybrid search combining keyword + vector + graph + re-ranking.
+        Гибридный поиск: keyword + vector + graph + реранжирование.
+
+        Выборка limit*3 (запас для реранга), дедупликация по id,
+        затем Cross-Encoder реранжирование (III.3) или сортировка
+        по исходному score при его недоступности.
 
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
+            user_id: Идентификатор пользователя
+            query: Поисковый запрос
+            limit: Максимум результатов
 
         Returns:
-            Combined results with scores
+            Объединённые результаты с оценками
         """
         # Fetch more results initially for better re-ranking
         fetch_limit = limit * 3
@@ -297,15 +319,19 @@ class MemorySearchService:
         max_facts: int = 5,
     ) -> str:
         """
-        Get memory context for LLM prompt.
+        Контекст памяти для промпта LLM.
+
+        Гибридный поиск по текущему сообщению; результаты собираются
+        в строку «Релевантная информация из памяти: ...» для подстановки
+        в промпт.
 
         Args:
-            user_id: User identifier
-            current_message: Current user message
-            max_facts: Maximum facts to include
+            user_id: Идентификатор пользователя
+            current_message: Текущее сообщение пользователя
+            max_facts: Максимум фактов в контексте
 
         Returns:
-            Context string for LLM
+            Строка контекста для LLM
         """
         search_results = await self.search(
             user_id=user_id,

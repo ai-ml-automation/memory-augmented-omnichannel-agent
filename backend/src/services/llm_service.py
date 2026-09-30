@@ -1,6 +1,17 @@
 """
-LLM Service
-Integration with LLM providers: YandexGPT, vLLM, GigaChat
+Сервис интеграции с LLM-провайдерами: YandexGPT, vLLM, GigaChat.
+
+Единая точка генерации текста для всех каналов ассистента и единая метрика
+длительности запроса (LLM_REQUEST_DURATION).
+
+Ключевые решения:
+- ленивая инициализация клиента — драйвер создаётся при первом вызове,
+  чтобы приложение работало без настроенных ключей до реальной потребности;
+- каскад провайдеров по LLM_PROVIDER: недоступный провайдер не роняет сервис,
+  а приводит к RuntimeError с описанием причины;
+- ошибки генерации пробрасываются наверх, метрика фиксируется в finally.
+
+@see PromptBuilder, backend.src.config
 """
 
 import logging
@@ -16,20 +27,45 @@ settings = get_settings()
 
 class LLMService:
     """
-    Unified LLM service.
+    Единый сервис генерации текста с каскадом LLM-провайдеров.
 
-    Supports multiple providers with fallback:
-    1. YandexGPT (primary)
-    2. vLLM/Qwen (fallback)
-    3. GigaChat (third option)
+    Ответственность: скрыть различия API провайдеров (YandexGPT, vLLM, GigaChat)
+    за общим интерфейсом generate() и вести единую метрику времени запроса.
+
+    Жизненный цикл: создаётся один раз на приложение; клиент выбранного
+    провайдера лениво инициализируется при первом обращении и переживает
+    весь жизненный цикл процесса.
+
+    Почему каскад, а не один провайдер: доступность и стоимость LLM-сервисов
+    меняются, а омниканальный ассистент не должен останавливаться при отказе
+    одного поставщика. Порядок попыток определяется конфигурацией LLM_PROVIDER.
+
+    @see _get_client, generate
     """
 
     def __init__(self):
+        """
+        Инициализация сервиса без создания клиента провайдера.
+
+        Клиент и выбранный провайдер хранятся в экземпляре и создаются лениво
+        при первом вызове _get_client — см. docstring _get_client.
+        """
         self._client = None
         self._provider = None
 
     def _get_client(self) -> tuple[Any, str]:
-        """Lazy initialization of LLM client."""
+        """
+        Ленивая инициализация клиента LLM-провайдера.
+
+        Почему лениво: создание клиента может потребовать недоступных пакетов
+        или сети, а сервис должен стартовать без LLM (ENABLE_LLM=false).
+        Выбор провайдера — каскадом по конфигурации LLM_PROVIDER: YandexGPT,
+        затем vLLM, затем GigaChat; первый успешно созданный клиент
+        запоминается и возвращается при последующих вызовах.
+
+        Raises:
+            RuntimeError: если LLM отключён или ни один провайдер не доступен
+        """
         if self._client is not None:
             return self._client, self._provider
 
@@ -93,15 +129,23 @@ class LLMService:
         **kwargs: Any,
     ) -> str:
         """
-        Generate text using LLM.
+        Генерация текста через выбранного LLM-провайдера.
+
+        Маршрутизирует вызов на провайдера (yandex/vllm/gigachat) и в блоке
+        finally фиксирует метрику LLM_REQUEST_DURATION — почему: время ответа
+        LLM критично для SLA омниканального ассистента, и метрика должна
+        записываться даже при ошибке генерации.
 
         Args:
-            prompt: Input prompt
-            max_tokens: Maximum tokens
-            temperature: Temperature
+            prompt: входной промпт для генерации
+            max_tokens: максимальное число токенов в ответе
+            temperature: температура сэмплирования (0 — детерминированно)
 
         Returns:
-            Generated text
+            сгенерированный текст
+
+        Raises:
+            RuntimeError: если LLM отключён (ENABLE_LLM=false)
         """
         if not settings.ENABLE_LLM:
             logger.warning("LLM disabled, returning placeholder")
@@ -143,7 +187,13 @@ class LLMService:
         temperature: float,
         **kwargs: Any,
     ) -> str:
-        """Generate using YandexGPT."""
+        """
+        Генерация текста через YandexGPT (yandex_cloud_ml).
+
+        Вызывается только из generate() для провайдера "yandex". Ошибки API
+        логируются и пробрасываются наверх, чтобы generate() мог записать
+        метрику в finally и вернуть ошибку вызывающему коду.
+        """
         try:
             # YandexGPT API call
             result = client.texts().generate(
@@ -170,7 +220,13 @@ class LLMService:
         temperature: float,
         **kwargs: Any,
     ) -> str:
-        """Generate using vLLM API."""
+        """
+        Генерация текста через vLLM (OpenAI-совместимый /v1/completions).
+
+        Используется httpx.AsyncClient — неблокирующий HTTP, чтобы запрос к LLM
+        не занимал поток FastAPI event loop. raise_for_status() превращает
+        ошибку HTTP в исключение, которое логируется выше в generate().
+        """
         try:
             response = await client.post(
                 "/v1/completions",
@@ -195,7 +251,13 @@ class LLMService:
         temperature: float,
         **kwargs: Any,
     ) -> str:
-        """Generate using GigaChat."""
+        """
+        Генерация текста через GigaChat (langchain_community).
+
+        Ленивый импорт GigaChat в _get_client означает, что пакет
+        langchain-community не является обязательной зависимостью: сервис
+        работает, даже если установлен только один из провайдеров.
+        """
         try:
             result = client.invoke(
                 prompt,
@@ -209,10 +271,14 @@ class LLMService:
 
     def get_provider_info(self) -> dict[str, Any]:
         """
-        Get current provider information.
+        Информация о текущем состоянии LLM-подсистемы.
+
+        Используется для диагностики и health-проверок: enabled показывает,
+        включён ли LLM в конфигурации, provider — выбранного провайдера,
+        initialized — создан ли уже клиент (ленивая инициализация).
 
         Returns:
-            Provider info dict
+            dict с ключами enabled, provider, initialized
         """
         return {
             "enabled": settings.ENABLE_LLM,

@@ -1,6 +1,9 @@
 """
-Session Service
-Session management for omnichannel interactions
+Сервис сессий омниканального взаимодействия.
+
+Сессия привязывает контекст диалога к пользователю и каналу (MAX, TG, VK, VOICE):
+позволяет продолжать разговор после переключения канала и хранить контекст
+между сообщениями. Открытая сессия — запись без ended_at.
 """
 
 import uuid
@@ -13,7 +16,12 @@ from backend.src.models import Session
 
 
 class SessionService:
-    """Service for managing user sessions."""
+    """
+    Сервис управления сессиями пользователя.
+
+    Операции: start (создать), end (закрыть), получить активную/историю.
+    Сессия считается активной, пока ended_at не установлен.
+    """
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -25,15 +33,16 @@ class SessionService:
         context_json: dict | None = None,
     ) -> Session:
         """
-        Start a new session.
+        Создание новой сессии.
 
+        started_at проставляется на уровне приложения: серверное время
+        одинаково для всех каналов и не зависит от часового пояса клиента.
         Args:
-            user_id: User identifier
-            channel_type: Channel type (MAX, TG, VK, VOICE)
-            context_json: Optional context data
-
+            user_id: идентификатор пользователя
+            channel_type: канал (MAX, TG, VK, VOICE)
+            context_json: стартовый контекст диалога
         Returns:
-            Created Session instance
+            созданная сессия Session
         """
         session = Session(
             id=uuid.uuid4(),
@@ -49,16 +58,15 @@ class SessionService:
 
     async def end_session(self, session_id: uuid.UUID) -> Session:
         """
-        End a session.
+        Закрытие сессии: простановка ended_at.
 
+        Сессия не удаляется — сохраняется для аудита и восстановления контекста.
         Args:
-            session_id: Session identifier
-
+            session_id: идентификатор сессии
         Returns:
-            Updated Session instance
-
+            обновлённая сессия Session
         Raises:
-            ValueError: If session not found
+            ValueError: если сессия не найдена
         """
         result = await self.db.execute(
             select(Session).where(Session.id == session_id)
@@ -79,14 +87,15 @@ class SessionService:
         channel_type: str,
     ) -> Session | None:
         """
-        Get active session for user and channel.
+        Активная сессия пользователя на канале.
 
+        Условие ended_at IS NULL гарантирует уникальность активной сессии:
+        канал не может вести два параллельных диалога с одним пользователем.
         Args:
-            user_id: User identifier
-            channel_type: Channel type
-
+            user_id: идентификатор пользователя
+            channel_type: канал (MAX, TG, VK, VOICE)
         Returns:
-            Active Session or None
+            Session или None
         """
         result = await self.db.execute(
             select(Session).where(
@@ -103,14 +112,14 @@ class SessionService:
         limit: int = 10,
     ) -> list[Session]:
         """
-        Get recent sessions for user.
+        История сессий пользователя (новые сверху).
 
+        limit ограничивает выборку — для UI достаточно последних N сессий.
         Args:
-            user_id: User identifier
-            limit: Maximum number of sessions
-
+            user_id: идентификатор пользователя
+            limit: максимальное число сессий
         Returns:
-            List of Session instances
+            список Session
         """
         result = await self.db.execute(
             select(Session)

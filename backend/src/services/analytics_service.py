@@ -1,6 +1,14 @@
 """
-Analytics Service
-Analytics and reporting for omnichannel agent
+Аналитика и отчётность для омниканального агента.
+
+Отдельный сервис агрегатов для дашборда и админки: считаем только COUNT и
+распределения по channel_type/category/часам — никогда не выгружаем сырые
+факты или аудит-логи. Это осознанное ограничение приватности (152-ФЗ):
+статистика не должна содержать персональных данных пользователей.
+
+Все агрегации выполняются на стороне БД (func.count/group_by), чтобы не
+тянуть строки в Python — отчётные эндпоинты остаются лёгкими при росте
+данных.
 """
 
 import logging
@@ -17,17 +25,26 @@ logger = logging.getLogger(__name__)
 
 
 class AnalyticsService:
-    """Service for analytics and reporting."""
+    """Сбор агрегированной статистики из БД для дашборда и админки.
+
+    Методы возвращают только числа и распределения, готовые к сериализации
+    в JSON. Ни один метод не раскрывает содержимое персональных данных —
+    только обезличенные счётчики (приватность, 152-ФЗ).
+    """
 
     def __init__(self, db: AsyncSession):
         self.db = db
 
     async def get_dashboard_stats(self) -> dict[str, Any]:
-        """
-        Get dashboard statistics.
+        """Счётчики верхнего уровня для главного экрана дашборда.
+
+        Считаем пользователей, активные сессии, активные факты, активные
+        согласия и аудит-события за сегодня. Вместо выборки строк используем
+        COUNT в БД — отчёт остаётся лёгким при любом объёме данных.
 
         Returns:
-            Dashboard stats
+            Словарь: users, active_sessions, total_facts, active_consents,
+            audit_today (числа, 0 при отсутствии данных).
         """
         # User count
         user_result = await self.db.execute(select(func.count(User.id)))
@@ -71,15 +88,20 @@ class AnalyticsService:
         user_id: uuid.UUID,
         days: int = 30,
     ) -> dict[str, Any]:
-        """
-        Get user activity stats.
+        """Активность конкретного пользователя за период.
+
+        Считаем сессии, созданные факты и аудит-действия с момента
+        since = now - days. Период ограничиваем на стороне БД (WHERE
+        >= since), а не фильтруем в Python. user_id возвращаем строкой,
+        чтобы ответ сериализовался в JSON без конвертации UUID.
 
         Args:
-            user_id: User identifier
-            days: Number of days to analyze
+            user_id: Идентификатор пользователя.
+            days: Глубина анализа в днях (по умолчанию 30).
 
         Returns:
-            Activity stats
+            Словарь: user_id, period_days, sessions, facts_created,
+            audit_actions.
         """
         since = datetime.utcnow() - timedelta(days=days)
 
@@ -119,11 +141,14 @@ class AnalyticsService:
         }
 
     async def get_channel_distribution(self) -> dict[str, int]:
-        """
-        Get channel usage distribution.
+        """Распределение сессий по типам каналов.
+
+        GROUP BY в БД возвращает пары channel_type -> количество сессий.
+        Нужно для понимания нагрузки по каналам (MAX/Telegram/VK) и
+        планирования ёмкости. Ключ channel_type — строка из модели сессии.
 
         Returns:
-            Channel distribution
+            Словарь {channel_type: количество сессий}.
         """
         result = await self.db.execute(
             select(
@@ -139,11 +164,15 @@ class AnalyticsService:
         return distribution
 
     async def get_fact_categories(self) -> dict[str, int]:
-        """
-        Get fact category distribution.
+        """Распределение активных фактов по категориям.
+
+        Считаем только is_active факты: неактивные (удалённые/просроченные)
+        не должны влиять на статистику памяти. Агрегация в БД — без
+        выгрузки самих фактов, содержимое которых может быть персональным
+        (152-ФЗ).
 
         Returns:
-            Category distribution
+            Словарь {категория: количество фактов}.
         """
         result = await self.db.execute(
             select(
@@ -162,14 +191,18 @@ class AnalyticsService:
         self,
         days: int = 7,
     ) -> list[dict[str, Any]]:
-        """
-        Get audit log timeline.
+        """Количество аудит-событий по дням за период.
+
+        func.date обрезает timestamp до даты, группировка идёт по дню —
+        получаем временной ряд для графика активности. Полезно как для
+        продуктовой аналитики, так и для мониторинга безопасности
+        (аномальные всплески операций).
 
         Args:
-            days: Number of days
+            days: Глубина периода в днях (по умолчанию 7).
 
         Returns:
-            Timeline data
+            Список словарей {date, count} в хронологическом порядке.
         """
         since = datetime.utcnow() - timedelta(days=days)
 
@@ -189,11 +222,14 @@ class AnalyticsService:
         ]
 
     async def get_peak_hours(self) -> list[dict[str, Any]]:
-        """
-        Get peak activity hours.
+        """Часовая активность аудит-событий.
+
+        func.extract("hour") группирует события по часу суток (0-23).
+        Используется для планирования нагрузки и проверки, когда система
+        реально используется — часы с пиками.
 
         Returns:
-            Hourly activity distribution
+            Список словарей {hour, count}, упорядоченный по часу.
         """
         result = await self.db.execute(
             select(

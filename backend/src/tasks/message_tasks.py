@@ -1,5 +1,18 @@
 """
-Celery tasks for message processing.
+Асинхронная обработка входящих сообщений через Celery.
+
+Webhook-роутеры отвечают клиенту 200 OK сразу (fire-and-forget), а тяжёлый
+конвейер MessageHandler (идентификация → consent-гейт 152-ФЗ → память → аудит)
+выполняется здесь, в фоне, отдельным воркером. Это развязывает время ответа
+мессенджера (Telegram/VK ждут быстрый ACK) и время обработки.
+
+Ключевые решения:
+- Celery, а не asyncio-таск-менеджер: задачи переживают рестарт API-процесса
+  и могут ретраиться; webhook не блокируется обработкой;
+- синхронная задача + asyncio.run: Celery не вызывает asyncio-корутины нативно,
+  поэтому внутренний пайплайн запускается через asyncio.run;
+- retry-политика 2 попытки с паузой 30 с: транзиентные сетевые сбои
+  (недоступность БД/мессенджера) уходят повторным запуском.
 """
 
 import logging
@@ -22,18 +35,23 @@ def process_message(
     text: str,
 ) -> dict:
     """
-    Process incoming message asynchronously.
+    Запуск полного конвейера обработки сообщения в фоне.
 
-    Dispatched from webhooks — returns 200 OK immediately.
-    This task runs the full MessageHandler pipeline in background.
+    Почему задача, а не прямой вызов: вебхук отвечает 200 сразу, а MessageHandler
+    выполняет медленные шаги (LLM, память, аудит). Здесь же выполняется коммит
+    транзакции — факты и аудит-записи становятся durable после обработки.
+
+    Ретраи: при любом исключении задача перезапускается (max_retries=2, пауза 30 с)
+    — типичная причина сбоя транзиентная (сеть, недоступность БД). После исчерпания
+    попыток исключение пробрасывается в Celery и видно в логах воркера/Flower.
 
     Args:
-        channel_type: Channel type (TG, VK, MAX, VOICE)
-        external_id: External user ID
-        text: Message text
+        channel_type: тип канала (TG, VK, MAX, VOICE)
+        external_id: внешний идентификатор пользователя в канале
+        text: текст входящего сообщения
 
     Returns:
-        Result dict with response text
+        dict с ключом ``response`` — ответ, сгенерированный конвейером
     """
     import asyncio
     from backend.src.database import async_session_factory

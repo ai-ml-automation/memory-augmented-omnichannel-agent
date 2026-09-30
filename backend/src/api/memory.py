@@ -1,6 +1,14 @@
 """
-Memory Router
-API endpoints for memory operations
+Роутер памяти: CRUD фактов, гибридный поиск и статистика пользователя.
+
+Тонкий HTTP-слой над FactService и MemorySearchService: сериализация схем,
+проверка владения фактом и коды ответов. Вся бизнес-логика (векторный поиск,
+гибридное ранжирование, суперсидирование) живёт в сервисах — роутер только
+связывает URL с сервисом, поэтому API памяти одинаково доступно из чата,
+голоса и webhooks.
+
+Изоляция: каждый эндпоинт требует user_id и проверяет, что факт принадлежит
+именно этому пользователю — чужие факты не видны и не удаляются.
 """
 
 import logging
@@ -20,7 +28,13 @@ router = APIRouter(prefix="/memory", tags=["memory"])
 
 
 class FactCreate(BaseModel):
-    """Fact creation schema — aligned with Fact model."""
+    """Схема создания факта — поля повторяют модель Fact.
+
+    fact_type валидируется на уровне API по белому списку VALID_FACT_TYPES,
+    чтобы в память не попали типы, которых не понимают поиск и аналитика.
+    weight в [0, 1] — вклад факта при ранжировании.
+    """
+
     fact_type: str = Field(
         ...,
         description=f"One of: {', '.join(sorted(VALID_FACT_TYPES))}",
@@ -31,7 +45,13 @@ class FactCreate(BaseModel):
 
 
 class FactResponse(BaseModel):
-    """Fact response schema — aligned with Fact model."""
+    """Схема ответа факта — выровнена с моделью Fact.
+
+    В БД поле называется fact_type, но во внешнем API используется компактный
+    alias "type"; populate_by_name разрешает принимать оба имени, поэтому
+    клиенты и внутренний код пишут по-разному, а наружу уходит один формат.
+    """
+
     id: str
     fact_type: str = Field(alias="type")
     value: str
@@ -44,14 +64,25 @@ class FactResponse(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    """Search request schema."""
+    """Схема запроса поиска по памяти.
+
+    search_type=hybrid по умолчанию: векторное + ключевое ранжирование даёт
+    лучшее качество, а "keyword"/"semantic" остаются для диагностики и тестов.
+    limit ограничивает объём выдачи (по умолчанию 10).
+    """
+
     query: str
     search_type: str = "hybrid"
     limit: int = 10
 
 
 class SearchResult(BaseModel):
-    """Search result schema."""
+    """Один результат поиска: источник и оценка релевантности.
+
+    score позволяет клиенту сортировать и порогово отсекать мусор; content
+    может быть строкой (факт) или словарём (запись из БД).
+    """
+
     id: str
     type: str
     content: str | dict
@@ -60,7 +91,13 @@ class SearchResult(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    """Search response schema."""
+    """Обёртка выдачи поиска.
+
+    Повторяет исходный запрос и тип поиска — клиент сопоставляет ответ
+    с запросом без дополнительного состояния. Плюс список результатов
+    и метаданные ранжирования.
+    """
+
     query: str
     search_type: str
     results: list[SearchResult]
@@ -74,14 +111,19 @@ async def store_fact(
     db: AsyncSession = Depends(get_db),
 ) -> FactResponse:
     """
-    Store a new fact for user.
+    Сохранить новый факт о пользователе.
+
+    201, а не 200: создан новый ресурс — клиент может различать создание
+    и обновление. Сервис сам обработает суперсидирование (устаревший факт
+    того же типа получит is_superseded=True).
 
     Args:
-        user_id: User identifier
-        data: Fact data
+        user_id: Владелец факта — изоляция памяти между пользователями.
+        data: Тип, значение, вес и канал факта.
+        db: Сессия БД.
 
     Returns:
-        Created fact
+        Созданный факт.
     """
     service = FactService(db)
     fact = await service.store_fact(
@@ -111,15 +153,19 @@ async def get_facts(
     db: AsyncSession = Depends(get_db),
 ) -> list[FactResponse]:
     """
-    Get facts for user.
+    Список фактов пользователя с опциональным фильтром по типу.
+
+    limit ограничен сверху 500 — защита от выгрузки всей памяти одним
+    запросом (и от случайного DoS большими выборками).
 
     Args:
-        user_id: User identifier
-        fact_type: Optional type filter
-        limit: Maximum results
+        user_id: Владелец фактов.
+        fact_type: Фильтр по типу факта (необязательно).
+        limit: Максимум результатов (<= 500).
+        db: Сессия БД.
 
     Returns:
-        List of facts
+        Список фактов пользователя.
     """
     service = FactService(db)
     facts = await service.get_facts(user_id, fact_type=fact_type, limit=limit)
@@ -145,17 +191,22 @@ async def get_fact(
     db: AsyncSession = Depends(get_db),
 ) -> FactResponse:
     """
-    Get fact by ID.
+    Получить факт по ID с проверкой владельца.
+
+    Чужой факт и несуществующий факт дают одинаковый 404 (без разницы
+    «нет ресурса» / «чужая запись») — это не раскрывает существование
+    чужих данных.
 
     Args:
-        user_id: User identifier
-        fact_id: Fact identifier
+        user_id: Ожидаемый владелец факта.
+        fact_id: Идентификатор факта.
+        db: Сессия БД.
 
     Returns:
-        Fact data
+        Данные факта.
 
     Raises:
-        404: Fact not found
+        404: Факт не найден или принадлежит другому пользователю.
     """
     service = FactService(db)
     fact = await service.get_fact(fact_id)
@@ -181,17 +232,22 @@ async def delete_fact(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """
-    Delete fact (hard delete, used for Right to be Forgotten).
+    Удалить факт (hard delete — для «права быть забытым», 152-ФЗ).
+
+    Полное физическое удаление, а не мягкая пометка: для RTBF требуется,
+    чтобы персональные данные реально исчезли из хранилища. Владелец
+    проверяется до удаления — чужие факты удалить нельзя.
 
     Args:
-        user_id: User identifier
-        fact_id: Fact identifier
+        user_id: Владелец факта.
+        fact_id: Идентификатор факта.
+        db: Сессия БД.
 
     Returns:
-        Success message
+        Статус операции.
 
     Raises:
-        404: Fact not found
+        404: Факт не найден или принадлежит другому пользователю.
     """
     service = FactService(db)
     fact = await service.get_fact(fact_id)
@@ -210,14 +266,19 @@ async def search_memory(
     db: AsyncSession = Depends(get_db),
 ) -> SearchResponse:
     """
-    Search user's memory.
+    Поиск по памяти пользователя (гибридный по умолчанию).
+
+    Делегирует MemorySearchService: комбинация векторного (Qdrant) и
+    ключевого (Postgres full-text) поиска с объединением результатов —
+    так находятся и точные совпадения, и семантически близкие факты.
 
     Args:
-        user_id: User identifier
-        data: Search request
+        user_id: Чья память ищется — поиск не выходит за границы пользователя.
+        data: Запрос, тип поиска и лимит.
+        db: Сессия БД.
 
     Returns:
-        Search results
+        Результаты поиска с повторённым запросом и метаданными.
     """
     service = MemorySearchService(db)
     results = await service.search(
@@ -250,13 +311,17 @@ async def get_memory_stats(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, int]:
     """
-    Get memory statistics for user.
+    Статистика памяти пользователя (счётчики по типам).
+
+    Возвращает агрегаты из FactService.get_user_stats — без выгрузки самих
+    фактов, поэтому эндпоинт дёшев и не раскрывает содержимое памяти.
 
     Args:
-        user_id: User identifier
+        user_id: Владелец памяти.
+        db: Сессия БД.
 
     Returns:
-        Statistics dict
+        Словарь «тип факта -> количество».
     """
     service = FactService(db)
     return await service.get_user_stats(user_id)

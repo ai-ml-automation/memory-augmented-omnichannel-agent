@@ -1,6 +1,10 @@
 """
-Integrations Package
-Channel gateways for messengers
+Пакет интеграций: шлюзы мессенджеров.
+
+Реэкспорт-фасад: MAXGateway, TelegramGateway, VKGateway — публичный
+контракт пакета (__all__ фиксирует его). VoiceGateway и VoiceProcessor
+намеренно не реэкспортируются: голосовой конвейер используется через
+voice_service, а не как часть фасада интеграций.
 """
 
 from backend.src.integrations.max_gateway import MAXGateway

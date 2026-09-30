@@ -1,6 +1,8 @@
 """
-E2E Tests for Health Endpoint
-Verifies /health is accessible without authentication.
+E2E-тесты health-эндпоинта через общий клиент.
+
+Проверяет, что /health доступен без аутентификации и отдаёт
+валидный статус со словарём подсистем.
 """
 
 import pytest
@@ -9,7 +11,11 @@ from httpx import AsyncClient
 
 @pytest.mark.asyncio
 async def test_health_endpoint(client: AsyncClient):
-    """GET /health -> 200 with service statuses."""
+    """Ловит поломку health: /health закрыт или не отдаёт статус.
+
+    /health обязан работать без cookie (для k8s probe и LB) и
+    содержать status + services — иначе деплой ломается.
+    """
     resp = await client.get("/health")
     assert resp.status_code == 200
     data = resp.json()

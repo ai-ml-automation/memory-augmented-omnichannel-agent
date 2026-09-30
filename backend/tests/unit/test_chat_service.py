@@ -1,7 +1,13 @@
 """
 Unit Tests for ChatService (Phase C.3.1)
 
-Pure-mock tests — verifies the prompt→LLM→evaluate→store pipeline.
+Pure-mock тесты конвейера обработки сообщения:
+prompt → LLM → evaluate → store (извлечение фактов в память).
+
+Зачем pure-mock: проверяют оркестрацию ChatService без реального LLM
+и БД — сборку промпта (с историей и без), передачу параметров генерации,
+вызов оценки ответа, сохранение извлечённых фактов и graceful degradation
+при отключённом LLM (плейсхолдер вместо падения).
 """
 
 import uuid
@@ -20,7 +26,13 @@ _PATCH_MEMORY = "backend.src.services.chat_service.Mem0MemoryService"
 
 
 def _make_svc():
-    """Create ChatService with all internal services mocked."""
+    """Создать ChatService со всеми внутренними сервисами-моками.
+
+    Returns:
+        ChatService: сервис, у которого prompt_builder, llm_service,
+        evaluator и memory заменены на MagicMock — доступны для
+        assert_awaited/assert_called в тестах.
+    """
     mock_db = MagicMock()
 
     with patch(_PATCH_PROMPT) as PromptCls, \
@@ -45,11 +57,21 @@ def _make_svc():
 
 
 class TestSendMessage:
-    """Tests for ChatService.send_message."""
+    """Группа тестов send_message: конвейер промпт → LLM → оценка → память.
+
+    Покрывают полный pipeline, вариант с историей диалога, сохранение
+    извлечённых фактов и плейсхолдер при отключённом LLM.
+    """
 
     @pytest.mark.asyncio
     async def test_send_message_builds_prompt_and_generates(self):
-        """Full pipeline: build_prompt → LLM generate → evaluate."""
+        """Ловит баг, если конвейер send_message рвётся на любом звене.
+
+        Проверяет весь путь: build_prompt вызывается с user_id/message/
+        channel_type, LLM получает собранный промпт с параметрами
+        (max_tokens=1000, temperature=0.7), evaluator оценивает ответ.
+        Результат содержит response, evaluation и facts_stored.
+        """
         svc = _make_svc()
 
         # build_prompt returns messages
@@ -95,7 +117,12 @@ class TestSendMessage:
 
     @pytest.mark.asyncio
     async def test_send_message_with_history(self):
-        """When history is provided, build_prompt_with_history is used."""
+        """Ловит баг, если при переданной истории строится не тот промпт.
+
+        Когда history передана, send_message обязан использовать
+        build_prompt_with_history (с историей и каналом) и НЕ вызывать
+        build_prompt. Игнорирование истории сломает контекст диалога.
+        """
         svc = _make_svc()
 
         history = [
@@ -129,7 +156,13 @@ class TestSendMessage:
 
     @pytest.mark.asyncio
     async def test_send_message_stores_facts(self):
-        """When should_store_fact is True, extracted facts are stored."""
+        """Ловит баг, если извлечённые из ответа факты не сохраняются.
+
+        При should_store_fact=True каждый факт обязан уйти в memory.store_fact
+        с корректными user_id/type/value/channel="text"/weight, а счётчик
+        facts_stored — совпасть с числом фактов. Потеря факта здесь
+        обедняет память ассистента о клиенте.
+        """
         svc = _make_svc()
 
         svc.prompt_builder.build_prompt = AsyncMock(
@@ -169,7 +202,12 @@ class TestSendMessage:
 
     @pytest.mark.asyncio
     async def test_send_message_llm_disabled_returns_placeholder(self):
-        """LLM disabled (RuntimeError) returns a placeholder response."""
+        """Ловит баг, если при отключённом LLM send_message падает.
+
+        Когда LLM бросает RuntimeError, сервис обязан вернуть плейсхолдер
+        «временно отключен» с facts_stored=0 и score=1.0, а не пробросить
+        исключение — иначе чат станет недоступен без LLM-провайдера.
+        """
         svc = _make_svc()
 
         svc.prompt_builder.build_prompt = AsyncMock(
@@ -193,10 +231,19 @@ class TestSendMessage:
 
 
 class TestGetLlmInfo:
-    """Tests for ChatService.get_llm_info."""
+    """Группа тестов get_llm_info: проброс информации о провайдере.
+
+    Проверяют, что сервис возвращает dict с провайдером и моделью
+    ровно от LLMService без искажений.
+    """
 
     def test_get_llm_info(self):
-        """get_llm_info returns the provider info dict from LLMService."""
+        """Ловит баг, если get_llm_info искажает данные о провайдере.
+
+        Метод обязан вернуть ровно тот dict (provider, model), который
+        отдаёт LLMService.get_provider_info, и вызвать его один раз.
+        Искажённые данные сломают отображение модели на дашборде.
+        """
         svc = _make_svc()
         provider_info = {"provider": "yandexgpt", "model": "yandexgpt-lite"}
         svc.llm_service.get_provider_info = MagicMock(return_value=provider_info)

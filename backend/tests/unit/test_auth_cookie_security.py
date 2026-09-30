@@ -1,7 +1,10 @@
 ﻿"""
-Tests for Auth Cookie Security (Phase B.2.3)
+Юнит-тесты безопасности cookie и CSRF (фаза B.2.3).
 
-B.2.3: SameSite=Strict cookies in production, CSRF double-submit pattern
+Проверяют SameSite/флаги Secure cookie по окружению (strict в production,
+lax в dev), генерацию CSRF-токена (64 hex-символа, уникальность), константы
+имён cookie/заголовка, структурно — установку CSRF-cookie в login и очистку
+в logout, а также пропуск CSRF-проверки в dev-режиме.
 """
 
 from unittest.mock import patch
@@ -22,38 +25,63 @@ from backend.src.api.auth import (
 
 
 class TestCookieSecurity:
-    """Tests for cookie security settings."""
+    """
+    SameSite и флаг Secure cookie по окружению (production vs development).
+
+    Ловит баги: одинаковые параметры cookie во всех окружениях — в production
+    обязателен SameSite=Strict и Secure=true, в dev — lax и Secure=false.
+    """
 
     def test_production_samesite_strict(self):
-        """In production, SameSite should be 'strict'."""
+        """
+        В production SameSite строго 'strict' — защита от CSRF через cookie.
+        Ловит баг расслабленного SameSite в проде (уязвимость CSRF).
+        """
         with patch("backend.src.api.auth.settings") as mock_settings:
             mock_settings.APP_ENV = "production"
             assert _cookie_samesite() == "strict"
 
     def test_development_samesite_lax(self):
-        """In development, SameSite should be 'lax'."""
+        """
+        В development SameSite = 'lax' — удобство локальной разработки.
+        Ловит баг жёсткого strict в dev (ломал запросы между портами).
+        """
         with patch("backend.src.api.auth.settings") as mock_settings:
             mock_settings.APP_ENV = "development"
             assert _cookie_samesite() == "lax"
 
     def test_production_secure_true(self):
-        """In production, Secure flag should be True."""
+        """
+        В production флаг Secure = True — cookie только по HTTPS.
+        Ловит баг cookie без Secure в проде (перехват по HTTP).
+        """
         with patch("backend.src.api.auth.settings") as mock_settings:
             mock_settings.APP_ENV = "production"
             assert _cookie_secure() is True
 
     def test_development_secure_false(self):
-        """In development, Secure flag should be False."""
+        """
+        В development флаг Secure = False — локальный HTTP без проблем.
+        Ловит баг Secure=true в dev (cookie не работает на localhost).
+        """
         with patch("backend.src.api.auth.settings") as mock_settings:
             mock_settings.APP_ENV = "development"
             assert _cookie_secure() is False
 
 
 class TestCSRFToken:
-    """Tests for CSRF token generation."""
+    """
+    Генерация CSRF-токена: формат и уникальность.
+
+    Ловит баги: не-строковый/короткий токен (слабый энтропии) и повторное
+    использование одного токена (перебор предсказуем, CSRF защита пуста).
+    """
 
     def test_generate_csrf_token_returns_hex(self):
-        """CSRF token should be a hex string."""
+        """
+        Токен — hex-строка из 64 символов (32 байта энтропии).
+        Ловит баг короткого токена или не-hex вывода (невалидный CSRF).
+        """
         token = _generate_csrf_token()
         assert isinstance(token, str)
         assert len(token) == 64  # 32 bytes = 64 hex chars
@@ -61,17 +89,28 @@ class TestCSRFToken:
         int(token, 16)
 
     def test_generate_csrf_token_unique(self):
-        """Each call should generate a different token."""
+        """
+        Повторные вызовы дают уникальные токены (10 из 10 разных).
+        Ловит баг детерминированной генерации (token предсказуем).
+        """
         tokens = {_generate_csrf_token() for _ in range(10)}
         assert len(tokens) == 10
 
 
 class TestCSRFVerification:
-    """Tests for CSRF double-submit verification."""
+    """
+    CSRF double-submit: пропуск в dev-режиме и константы имён.
+
+    Ловит баги: CSRF-проверка в dev (ломает локальную разработку) и
+    рассинхрон имён cookie/заголовка между кодом и фронтендом.
+    """
 
     @pytest.fixture
     def app(self):
-        """Create a minimal app for CSRF testing."""
+        """Минимальное приложение для CSRF-тестов.
+
+        Отдельный роутер изолирует CSRF-сценарии от основного API.
+        """
         from fastapi import FastAPI
 
         test_app = FastAPI()
@@ -89,7 +128,10 @@ class TestCSRFVerification:
         return test_app
 
     def test_get_skips_csrf(self):
-        """GET requests should skip CSRF verification."""
+        """
+        В dev-режиме CSRF пропускается для всех методов, включая GET.
+        Ловит баг CSRF-проверки на GET — GET не должен требовать токен.
+        """
         # In development mode, CSRF is skipped entirely
         with patch("backend.src.api.auth.settings") as mock_settings:
             mock_settings.APP_ENV = "development"
@@ -98,23 +140,37 @@ class TestCSRFVerification:
             # This is tested implicitly - dev mode skips all CSRF
 
     def test_dev_mode_skips_csrf(self):
-        """In development mode, CSRF is skipped for all methods."""
+        """
+        Отсутствие токенов в dev не роняет запрос (проверка _is_production).
+        Ловит баг принудительной CSRF-проверки в development-окружении.
+        """
         with patch("backend.src.api.auth.settings") as mock_settings:
             mock_settings.APP_ENV = "development"
             # Should not raise even without tokens
             # This is verified by the _is_production() check
 
     def test_csrf_constants(self):
-        """Verify CSRF cookie and header names."""
+        """
+        Имена CSRF cookie и заголовка стабильны и согласованы с фронтендом.
+        Ловит баг переименования константы без обновления фронтенда.
+        """
         assert CSRF_COOKIE_NAME == "csrf_token"
         assert CSRF_HEADER_NAME == "x-csrf-token"
 
 
 class TestLoginCookieSettings:
-    """Tests that login endpoint sets correct cookie attributes."""
+    """
+    Структурные проверки login: CSRF-cookie и параметры cookie.
+
+    Ловит баги: отсутствие установки CSRF-cookie при логине (фронтенд не
+    получит токен) и отказ от _cookie_samesite/_cookie_secure в login.
+    """
 
     def test_login_sets_csrf_cookie(self):
-        """Login should set a CSRF cookie alongside the JWT cookie."""
+        """
+        Код login вызывает установку CSRF-cookie (структурный тест).
+        Ловит баг пропуска _set_csrf_cookie — после логина нет CSRF-токена.
+        """
         # This is a structural test - verify the login endpoint code
         # sets the CSRF cookie by checking the source
         import inspect
@@ -125,7 +181,10 @@ class TestLoginCookieSettings:
         assert "_set_csrf_cookie" in source
 
     def test_login_uses_same_site_strict_in_production(self):
-        """Login cookie should use samesite from _cookie_samesite()."""
+        """
+        Login берёт samesite/secure из _cookie_samesite()/_cookie_secure().
+        Ловит баг захардкоженных параметров cookie в login (игнор окружения).
+        """
         import inspect
         from backend.src.api.auth import login
 
@@ -135,10 +194,18 @@ class TestLoginCookieSettings:
 
 
 class TestLogoutClearsCSRF:
-    """Tests that logout clears CSRF cookie."""
+    """
+    Структурная проверка logout: очистка CSRF-cookie.
+
+    Ловит баг logout без удаления CSRF-cookie — токен остаётся в браузере
+    после выхода, следующий логин получает устаревший токен.
+    """
 
     def test_logout_clears_csrf_cookie(self):
-        """Logout should clear the CSRF cookie."""
+        """
+        Код logout удаляет cookie через константу CSRF_COOKIE_NAME.
+        Ловит баг delete_cookie со строковым литералом (рассинхрон имён).
+        """
         import inspect
         from backend.src.api.auth import logout
 

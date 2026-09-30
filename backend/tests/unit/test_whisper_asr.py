@@ -1,7 +1,11 @@
 """
 Unit Tests for WhisperASR Service (Phase D.3.1)
 
-Pure-mock tests — no actual Whisper model loading.
+Pure-mock тесты распознавания речи — реальная модель Whisper не грузится.
+
+Зачем эти тесты: ASR-канал зависит от внешней модели и флага ENABLE_ASR.
+Тесты фиксируют graceful degradation (выключенный канал, отсутствующий
+пакет whisper) и успешную транскрипцию с расчётом confidence.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,12 +17,21 @@ _PATCH_ASR_SETTINGS = "backend.src.services.whisper_asr.settings"
 
 
 class TestWhisperASR:
-    """Tests for WhisperASR transcribe (D.3.1)."""
+    """Группа тестов WhisperASR.transcribe (D.3.1).
+
+    Покрывают выключенный канал (ENABLE_ASR=False), отсутствующий
+    пакет whisper и успешную транскрипцию с confidence.
+    """
 
     @pytest.mark.asyncio
     @patch(_PATCH_ASR_SETTINGS)
     async def test_transcribe_disabled_returns_error(self, mock_settings):
-        """When ENABLE_ASR=False, transcribe returns error dict."""
+        """Ловит баг, если при ENABLE_ASR=False канал не отключается.
+
+        transcribe обязан вернуть success=False с пустым текстом и ошибкой
+        "disabled", не трогая модель. Пропуск флага приведёт к попытке
+        загрузить Whisper без необходимости и к падению в проде.
+        """
         from backend.src.services.whisper_asr import WhisperASR
 
         mock_settings.ENABLE_ASR = False
@@ -33,7 +46,12 @@ class TestWhisperASR:
     @pytest.mark.asyncio
     @patch(_PATCH_ASR_SETTINGS)
     async def test_transcribe_model_not_installed(self, mock_settings):
-        """When whisper package is missing, RuntimeError is raised."""
+        """Ловит баг, если отсутствие пакета whisper роняет transcribe.
+
+        Когда модуль whisper недоступен (patch.dict sys.modules),
+        transcribe обязан вернуть success=False с сообщением об ошибке,
+        а не бросить исключение — ASR-канал деградирует мягко.
+        """
         from backend.src.services.whisper_asr import WhisperASR
 
         mock_settings.ENABLE_ASR = True
@@ -51,7 +69,12 @@ class TestWhisperASR:
     @pytest.mark.asyncio
     @patch(_PATCH_ASR_SETTINGS)
     async def test_transcribe_success(self, mock_settings):
-        """When whisper is mocked, transcribe returns text and confidence."""
+        """Ловит баг, если успешная транскрипция теряет текст/confidence.
+
+        При замоканной модели transcribe обязан вернуть success=True,
+        распознанный текст (кириллица), язык и confidence в диапазоне
+        [0, 1], рассчитанный из avg_logprob сегментов.
+        """
         from backend.src.services.whisper_asr import WhisperASR
 
         mock_settings.ENABLE_ASR = True

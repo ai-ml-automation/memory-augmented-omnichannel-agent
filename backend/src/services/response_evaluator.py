@@ -1,6 +1,17 @@
 """
-Response Evaluator
-Evaluates quality and safety of LLM responses
+Оценка качества и безопасности ответов LLM.
+
+Скоринг ответа по четырём проверкам: токсичность, утечка PII, релевантность
+и длина. Итоговый score = 1.0, умноженный на штрафы за нарушения — чем больше
+проблем, тем ниже качество.
+
+Ключевые решения:
+- штраф за PII самый жёсткий (×0.5): персональные данные в ответе недопустимы
+  (152-ФЗ);
+- проверки реализованы как лёгкие эвристики (ключевые слова, regex, пересечение
+  слов) и заменяются на ML-модели при ENABLE_LLM=true — интерфейс не меняется;
+- evaluate вызывается перед сохранением фактов: низкое качество блокирует
+  запись в память.
 """
 
 import logging
@@ -14,16 +25,25 @@ settings = get_settings()
 
 class ResponseEvaluator:
     """
-    Evaluates LLM responses for quality and safety.
+    Оценка ответов LLM по качеству и безопасности.
 
-    Checks:
-    - Toxicity
-    - Relevance
-    - Factuality
-    - PII leakage
+    Жизненный цикл: создаётся без тяжёлых зависимостей; ML-модели (токсичность,
+    релевантность) инициализируются лениво при ENABLE_LLM=true.
+
+    Почему эвристики вместо моделей по умолчанию: приложение должно работать
+    и тестироваться без ML-стека, а пороги оценок (0.7 для сохранения фактов)
+    зависят от точности используемых проверок.
+
+    Метрики: score в диапазоне 0..1; чем ближе к 1, тем ответ лучше.
     """
 
     def __init__(self):
+        """
+        Инициализация без загрузки моделей.
+
+        Слоты _toxicity_model и _relevance_model заполняются лениво при первом
+        использовании (если ENABLE_LLM=true) — экономит память и время старта.
+        """
         self._toxicity_model = None
         self._relevance_model = None
 
@@ -34,14 +54,21 @@ class ResponseEvaluator:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
-        Evaluate response quality.
+        Оценка качества ответа по всем проверкам.
+
+        Итоговый score мультипликативный: каждая проваленная проверка умножает
+        текущий score на свой штраф (PII ×0.5 — самый строгий, 152-ФЗ; низкая
+        релевантность ×0.8; слишком длинный/короткий ответ ×0.9). Так оценка
+        отражает накопление проблем, а не только худшую из них.
 
         Args:
-            response: LLM response
-            context: Original context/message
+            response: текст ответа LLM
+            context: исходное сообщение/контекст; проверка релевантности
+                выполняется только при его наличии
 
         Returns:
-            Evaluation results
+            dict: score (0..1), checks (детали по каждой проверке),
+                warnings (список причин снижения)
         """
         results = {
             "score": 1.0,
@@ -92,13 +119,19 @@ class ResponseEvaluator:
 
     async def _check_toxicity(self, text: str) -> dict[str, Any]:
         """
-        Check for toxic content.
+        Проверка на токсичность ответа.
+
+        При ENABLE_LLM=false проверка пропускается (score 1.0, detected False):
+        заглушка не должна блокировать работу без ML-стека. При включённом LLM
+        используется список запрещённых слов, каждый найденный термин снижает
+        score на 0.2 (минимум 0.0).
 
         Args:
-            text: Text to check
+            text: текст для проверки
 
         Returns:
-            Toxicity score
+            dict: score (0..1), detected (True при наличии токсичных слов),
+                keywords (список найденных слов)
         """
         if not settings.ENABLE_LLM:
             return {"score": 1.0, "detected": False}
@@ -121,13 +154,20 @@ class ResponseEvaluator:
 
     async def _check_pii_leakage(self, text: str) -> dict[str, Any]:
         """
-        Check for PII leakage.
+        Проверка ответа на утечку персональных данных (PII).
+
+        Просматривает текст регулярными выражениями по типам: телефон, email,
+        ИНН (12 цифр), СНИЛС. Обнаружение любого типа — признак потенциальной
+        утечки: ответы LLM не должны содержать персональные данные (152-ФЗ).
+
+        Почему import re внутри метода: модуль нужен только здесь, импорт
+        на верхнем уровне не даёт выигрыша, а изоляция упрощает тестирование.
 
         Args:
-            text: Text to check
+            text: текст для проверки
 
         Returns:
-            PII detection results
+            dict: detected (True при совпадении), types (список найденных типов)
         """
         import re
 
@@ -155,14 +195,18 @@ class ResponseEvaluator:
         context: str,
     ) -> dict[str, Any]:
         """
-        Check response relevance to context.
+        Оценка релевантности ответа контексту.
+
+        Используется пересечение множеств слов как placeholder для будущего
+        сравнения эмбеддингов: дёшево, детерминированно и работает без ML.
+        Пустой контекст даёт нейтральные 0.5.
 
         Args:
-            response: LLM response
-            context: Original context
+            response: текст ответа LLM
+            context: исходный контекст/сообщение
 
         Returns:
-            Relevance score
+            dict: score (0..1), доля слов контекста, встретившихся в ответе
         """
         # Simple keyword overlap (placeholder for embedding similarity)
         context_words = set(context.lower().split())
@@ -178,13 +222,18 @@ class ResponseEvaluator:
 
     async def _check_length(self, text: str) -> dict[str, Any]:
         """
-        Check response length.
+        Проверка длины ответа.
+
+        Лимиты: максимум 2000 символов (защита от "простыни" текста в каналы
+        с ограничением длины сообщения), минимум 10 символов (отсечение пустых
+        и бессодержательных ответов). Нарушение снижает итоговый score (×0.9).
 
         Args:
-            text: Response text
+            text: текст ответа
 
         Returns:
-            Length check results
+            dict: ok (True при прохождении), reason (причина отказа),
+                length (длина текста при ok=True)
         """
         max_length = 2000
         min_length = 10
@@ -210,14 +259,19 @@ class ResponseEvaluator:
         **kwargs: Any,
     ) -> bool:
         """
-        Determine if response contains storable facts.
+        Решение: сохранять ли факты из ответа в память.
+
+        Три условия: score ≥ 0.7 (достаточно качественный ответ), отсутствие PII
+        (персональные данные не должны попадать в память — 152-ФЗ) и наличие
+        фактологических маркеров ("вы сказали", "по данным" и т.п.), отделяющих
+        утверждения о пользователе от обычного текста.
 
         Args:
-            response: LLM response
-            evaluation: Evaluation results
+            response: текст ответа LLM
+            evaluation: результат evaluate (score и checks)
 
         Returns:
-            True if should store
+            True, если ответ содержит факты для сохранения
         """
         # Don't store if quality is low
         if evaluation["score"] < 0.7:

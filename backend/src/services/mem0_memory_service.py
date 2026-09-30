@@ -1,11 +1,10 @@
 """
-Mem0 Memory Service
-Concrete implementation of MemoryService using FactService,
-VectorStoreService, and GraphService.
+Mem0 Memory Service: конкретная реализация MemoryService на основе
+FactService, VectorStoreService и GraphService.
 
-Wraps external stores (Qdrant, Neo4j) with graceful degradation —
-failures in vector indexing or graph writes never block the core
-PostgreSQL-backed fact storage.
+ПОЧЕМУ graceful degradation: сбои внешних хранилищ (Qdrant, Neo4j)
+не блокируют основное хранение фактов в PostgreSQL — индексация
+в вектор и граф выполняется best-effort.
 """
 
 import logging
@@ -25,8 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 class Mem0MemoryService(MemoryService):
-    """Concrete memory service delegating to FactService, VectorStoreService,
-    and GraphService with graceful degradation for external stores."""
+    """
+    Конкретная реализация MemoryService.
+
+    Делегирует хранение фактов FactService, векторную индексацию
+    VectorStoreService, граф — GraphService, удаление по RTBF —
+    RightToBeForgottenService. Внешние хранилища деградируют мягко.
+    """
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -44,11 +48,11 @@ class Mem0MemoryService(MemoryService):
         channel: str,
         weight: float = 1.0,
     ) -> Any:
-        """Store a fact via FactService and optionally index in VectorStore / Graph.
+        """
+        Сохранить факт: PostgreSQL обязателен, вектор и граф — best-effort.
 
-        Core storage (PostgreSQL via FactService) is mandatory.
-        Vector and graph indexing are best-effort — logged and swallowed
-        on failure so the caller still receives the stored fact.
+        ПОЧЕМУ: основное хранение (FactService) не должно зависеть
+        от внешних сервисов — их сбой логируется и не роняет запись.
         """
         fact = await self._fact_service.store_fact(
             user_id=user_id,
@@ -98,7 +102,13 @@ class Mem0MemoryService(MemoryService):
         query: str = "",
         limit: int = 10,
     ) -> list[Any]:
-        """Retrieve facts via FactService."""
+        """
+        Получить факты через FactService.get_facts.
+
+        ПОЧЕМУ query игнорируется: интерфейс ABC требует параметр,
+        но выборка последних фактов не фильтрует по тексту — для
+        поиска используйте search_facts.
+        """
         return await self._fact_service.get_facts(
             user_id=user_id,
             limit=limit,
@@ -110,7 +120,12 @@ class Mem0MemoryService(MemoryService):
         query: str,
         limit: int = 10,
     ) -> list[Any]:
-        """Search facts by text via FactService."""
+        """
+        Найти факты по тексту через FactService.search_facts.
+
+        Реализация текстового поиска (in-memory по расшифрованным
+        значениям) — см. предупреждения в FactService.search_facts.
+        """
         return await self._fact_service.search_facts(
             user_id=user_id,
             query=query,
@@ -118,7 +133,12 @@ class Mem0MemoryService(MemoryService):
         )
 
     async def delete_user_data(self, user_id: uuid.UUID) -> dict[str, Any]:
-        """Delete all user data (RTBF) via RightToBeForgottenService."""
+        """
+        Удалить все данные пользователя через RightToBeForgottenService.
+
+        Возврат нормализуется к dict[str, Any] — сигнатура ABC
+        допускает Any, но контракт интерфейса остаётся строгим.
+        """
         result = await self._rtbf_service.delete_user_data(user_id=user_id)
         # Normalise return to dict[str, Any] as declared in the ABC
         return dict(result)
@@ -129,7 +149,12 @@ class Mem0MemoryService(MemoryService):
         current_message: str,
         max_facts: int = 5,
     ) -> str:
-        """Get memory context string for LLM prompt via MemorySearchService."""
+        """
+        Контекст памяти для промпта LLM через MemorySearchService.
+
+        Гибридный поиск (keyword + vector + graph) с реранжированием;
+        подробности — в MemorySearchService.get_memory_context.
+        """
         return await self._search_service.get_memory_context(
             user_id=user_id,
             current_message=current_message,

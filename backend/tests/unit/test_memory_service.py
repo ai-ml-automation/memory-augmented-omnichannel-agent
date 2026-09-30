@@ -1,9 +1,13 @@
 """
 Unit Tests for Mem0MemoryService (Phase C.1.1)
 
-Pure-mock tests — no database required.
-Verifies delegation to sub-services and graceful degradation
-when vector store / graph indexing fails.
+Pure-mock тесты — база данных не нужна. Проверяют делегирование вызовов
+суб-сервисам (FactService, VectorStoreService, GraphService,
+RightToBeForgottenService, MemorySearchService) и graceful degradation:
+падение векторного хранилища или графа не должно терять сохранённый факт.
+
+Зачем pure-mock: mem0-оркестратор не должен знать про SQL/векторные
+детали, тесты фиксируют его контракт делегирования без инфраструктуры.
 """
 
 import uuid
@@ -23,7 +27,13 @@ _PATCH_SEARCH = "backend.src.services.mem0_memory_service.MemorySearchService"
 
 
 def _make_svc():
-    """Create Mem0MemoryService with all internal services mocked."""
+    """Создать Mem0MemoryService со всеми внутренними сервисами-моками.
+
+    Returns:
+        Mem0MemoryService: оркестратор, у которого _fact_svc, _vector_svc,
+        _graph_svc, _rtbf_svc и _search_svc заменены на MagicMock —
+        доступны для assert_awaited/assert_called в тестах.
+    """
     mock_db = MagicMock()
 
     with patch(_PATCH_FACT) as FactCls, \
@@ -51,11 +61,21 @@ def _make_svc():
 
 
 class TestStoreFact:
-    """Tests for Mem0MemoryService.store_fact."""
+    """Группа тестов store_fact: делегирование в FactService.
+
+    Покрывают проброс аргументов в FactService.store_fact, индексацию
+    факта в векторное хранилище и граф, а также graceful degradation
+    при падении индексации.
+    """
 
     @pytest.mark.asyncio
     async def test_store_fact_delegates_to_fact_service(self):
-        """store_fact calls FactService.store_fact with correct args."""
+        """Ловит баг, если store_fact не пробрасывает аргументы в FactService.
+
+        assert_awaited_once_with проверяет точные user_id, fact_type, value,
+        channel, weight. Потерянный аргумент здесь — сломанное сохранение
+        факта с неверным типом или каналом.
+        """
         svc = _make_svc()
         fact_id = uuid.uuid4()
         mock_fact = MagicMock()
@@ -82,7 +102,12 @@ class TestStoreFact:
 
     @pytest.mark.asyncio
     async def test_store_fact_indexes_in_vector_store(self):
-        """After FactService succeeds, VectorStoreService.index_fact is called."""
+        """Ловит баг, если сохранённый факт не попадает в векторное хранилище.
+
+        index_fact обязан получить fact_id, user_id, content и metadata
+        с типом и каналом. Без индекса семантический поиск не найдёт
+        факт по смыслу запроса.
+        """
         svc = _make_svc()
         fact_id = uuid.uuid4()
         mock_fact = MagicMock()
@@ -107,7 +132,12 @@ class TestStoreFact:
 
     @pytest.mark.asyncio
     async def test_store_fact_indexes_in_graph(self):
-        """After FactService succeeds, GraphService.create_fact_node is called."""
+        """Ловит баг, если факт не попадает в граф знаний.
+
+        create_fact_node обязан получить id, категорию, сводку содержимого
+        и consent_verified=True. Без узла в графе не построятся связи
+        между фактами клиента.
+        """
         svc = _make_svc()
         fact_id = uuid.uuid4()
         mock_fact = MagicMock()
@@ -134,7 +164,12 @@ class TestStoreFact:
 
     @pytest.mark.asyncio
     async def test_store_fact_vector_failure_is_swallowed(self):
-        """VectorStoreService raising does NOT prevent store_fact from returning."""
+        """Ловит баг, если падение векторного хранилища теряет факт.
+
+        Когда VectorStoreService бросает исключение, store_fact обязан
+        всё равно вернуть сохранённый факт, а индексация в граф —
+        продолжиться. Qdrant лежит — база фактов не должна терять данные.
+        """
         svc = _make_svc()
         fact_id = uuid.uuid4()
         mock_fact = MagicMock()
@@ -156,7 +191,12 @@ class TestStoreFact:
 
     @pytest.mark.asyncio
     async def test_store_fact_graph_failure_is_swallowed(self):
-        """GraphService raising does NOT prevent store_fact from returning."""
+        """Ловит баг, если падение графа теряет факт.
+
+        Когда GraphService бросает исключение, store_fact обязан всё
+        равно вернуть факт, а векторная индексация — продолжиться.
+        Neo4j лежит — факт должен сохраниться и быть доступным.
+        """
         svc = _make_svc()
         fact_id = uuid.uuid4()
         mock_fact = MagicMock()
@@ -185,11 +225,20 @@ class TestStoreFact:
 
 
 class TestRetrieveFacts:
-    """Tests for Mem0MemoryService.retrieve_facts."""
+    """Группа тестов retrieve_facts: делегирование в FactService.get_facts.
+
+    Проверяют, что user_id и limit пробрасываются ниже, а параметр query
+    намеренно не передаётся — он не входит в контракт get_facts.
+    """
 
     @pytest.mark.asyncio
     async def test_retrieve_facts_delegates(self):
-        """retrieve_facts delegates to FactService.get_facts."""
+        """Ловит баг, если retrieve_facts не пробрасывает user_id и limit.
+
+        FactService.get_facts должен вызываться ровно с этими аргументами,
+        а результат — возвращаться без изменений. Неверный лимит или
+        потерянный user_id исказят выборку фактов.
+        """
         svc = _make_svc()
         expected = [MagicMock(), MagicMock()]
         svc._fact_svc.get_facts = AsyncMock(return_value=expected)
@@ -207,11 +256,20 @@ class TestRetrieveFacts:
 
 
 class TestSearchFacts:
-    """Tests for Mem0MemoryService.search_facts."""
+    """Группа тестов search_facts: делегирование в FactService.search_facts.
+
+    Проверяют проброс query и limit в поиск по расшифрованным значениям
+    и неизменность возвращаемого списка фактов.
+    """
 
     @pytest.mark.asyncio
     async def test_search_facts_delegates(self):
-        """search_facts delegates to FactService.search_facts."""
+        """Ловит баг, если search_facts не пробрасывает query и limit.
+
+        FactService.search_facts должен вызываться ровно с user_id, query
+        и limit, а результат — возвращаться как есть. Потеря query
+        превратит поиск в выдачу всех фактов пользователя.
+        """
         svc = _make_svc()
         expected = [MagicMock()]
         svc._fact_svc.search_facts = AsyncMock(return_value=expected)
@@ -231,11 +289,20 @@ class TestSearchFacts:
 
 
 class TestDeleteUserData:
-    """Tests for Mem0MemoryService.delete_user_data."""
+    """Группа тестов delete_user_data: делегирование в RTBF-сервис.
+
+    Проверяют вызов RightToBeForgottenService.delete_user_data и
+    нормализацию результата к словарю — основа права на забвение.
+    """
 
     @pytest.mark.asyncio
     async def test_delete_user_data_delegates(self):
-        """delete_user_data delegates to RightToBeForgottenService."""
+        """Ловит баг, если delete_user_data не вызывает RTBF-сервис.
+
+        RightToBeForgottenService.delete_user_data обязан вызываться
+        с user_id, а результат — нормализоваться к dict с deleted_facts
+        и deleted_consent. Молчаливый пропуск удаления = данные остаются.
+        """
         svc = _make_svc()
         rtbf_result = {"deleted_facts": 5, "deleted_consent": True}
         svc._rtbf_svc.delete_user_data = AsyncMock(return_value=rtbf_result)
@@ -254,11 +321,20 @@ class TestDeleteUserData:
 
 
 class TestGetMemoryContext:
-    """Tests for Mem0MemoryService.get_memory_context."""
+    """Группа тестов get_memory_context: делегирование в MemorySearchService.
+
+    Проверяют проброс user_id, current_message и max_facts в построение
+    контекстной строки для LLM.
+    """
 
     @pytest.mark.asyncio
     async def test_get_memory_context_delegates(self):
-        """get_memory_context delegates to MemorySearchService."""
+        """Ловит баг, если контекст строится без нужных параметров.
+
+        MemorySearchService.get_memory_context обязан получить current_message
+        и max_facts, а вернуть строку контекста для LLM. Потеря сообщения
+        пользователя обесценит контекст памяти в ответе ассистента.
+        """
         svc = _make_svc()
         svc._search_svc.get_memory_context = AsyncMock(
             return_value="User prefers dark mode."

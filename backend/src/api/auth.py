@@ -1,10 +1,15 @@
 ﻿"""
-Auth Router
-Endpoints for user registration, login, logout
+Роутер аутентификации: регистрация, логин, логаут и текущий пользователь.
 
-Security (Phase B.2.3):
-- SameSite=Strict cookies for production
-- CSRF double-submit cookie pattern
+Критичный для безопасности слой (Phase B.2.3). Сессия живёт в httpOnly-cookie
+с SameSite=Strict в production — так токен недоступен JavaScript и не
+уходит кросс-доменным запросам. Плюс CSRF double-submit: отдельная cookie
+csrf_token (не-httpOnly, чтобы JS отправлял её в заголовке X-CSRF-Token)
+сравнивается через secrets.compare_digest — защита от подделки state-changing
+запросов и от timing-атак.
+
+Строгие режимы (Secure cookie, проверка CSRF) включаются только в production
+по APP_ENV: в development они мешали бы локальной разработке.
 """
 
 import secrets
@@ -26,22 +31,39 @@ CSRF_HEADER_NAME = "x-csrf-token"
 
 
 def _is_production() -> bool:
-    """Check if running in production environment."""
+    """Только в production включаем строгие cookie и проверку CSRF.
+
+    Один флаг окружения переключает все security-настройки разом,
+    а не размазывает if'ы по коду.
+    """
     return settings.APP_ENV == "production"
 
 
 def _cookie_samesite() -> str:
-    """B.2.3: SameSite=Strict in production, Lax in development."""
+    """SameSite для cookie сессии.
+
+    B.2.3: Strict в production не даёт отправлять cookie кросс-доменным
+    запросам; Lax в разработке не мешает локальным переходам.
+    """
     return "strict" if _is_production() else "lax"
 
 
 def _cookie_secure() -> bool:
-    """Secure flag only in production (requires HTTPS)."""
+    """Secure-флаг только в production.
+
+    По спецификации cookie с Secure требует HTTPS — в development
+    (http://localhost) она просто не сохранилась бы браузером.
+    """
     return _is_production()
 
 
 def _set_csrf_cookie(response: Response, token: str) -> None:
-    """Set CSRF double-submit cookie (non-httpOnly so JS can read it)."""
+    """Выставить CSRF double-submit cookie (не-httpOnly — JS должен её читать).
+
+    Пары cookie+заголовок достаточно: атакующий сайт не может ни прочитать
+    cookie чужого origin (SameSite), ни выставить произвольный заголовок
+    простой формой.
+    """
     response.set_cookie(
         key=CSRF_COOKIE_NAME,
         value=token,
@@ -53,21 +75,27 @@ def _set_csrf_cookie(response: Response, token: str) -> None:
 
 
 def _generate_csrf_token() -> str:
-    """Generate a cryptographically random CSRF token."""
+    """Криптографически случайный CSRF-токен.
+
+    secrets.token_hex, а не random: токен — секрет, предсказуемые
+    значения сломали бы всю CSRF-защиту.
+    """
     return secrets.token_hex(32)
 
 
 def verify_csrf(request: Request) -> None:
     """
-    Verify CSRF double-submit cookie.
+    Проверка CSRF double-submit cookie.
 
-    For state-changing requests (POST/PUT/DELETE), the client must:
-    1. Include the csrf_token cookie (set automatically by the browser)
-    2. Send the same value in the X-CSRF-Token header
+    Для state-changing запросов (POST/PUT/DELETE) клиент обязан:
+    1. Прислать cookie csrf_token (браузер ставит автоматически)
+    2. Продублировать значение в заголовке X-CSRF-Token
 
-    This prevents CSRF because an attacker cannot read cookies from
-    a different origin (SameSite policy) and cannot set headers
-    via simple forms.
+    Защита работает потому, что атакующий сайт не может прочитать cookie
+    чужого origin (SameSite) и не может выставить заголовок простой формой.
+
+    GET/HEAD/OPTIONS — безопасные методы, пропускаются. В development
+    проверка отключена, чтобы не мешать локальной отладке.
     """
     # Skip CSRF for GET/HEAD/OPTIONS (safe methods)
     if request.method in ("GET", "HEAD", "OPTIONS"):
@@ -99,17 +127,22 @@ async def register(
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     """
-    Register new user.
+    Регистрация нового пользователя.
+
+    Телефон не хранится открытым текстом — сервис сохраняет только
+    phone_hash (152-ФЗ), поэтому в ответе нет телефона. Ошибки сервиса
+    (пользователь уже существует) превращаются в 400 с человекочитаемым
+    текстом, а не в 500.
 
     Args:
-        user_data: User registration data (phone, password)
-        db: Database session
+        user_data: Данные регистрации (phone, password).
+        db: Сессия БД.
 
     Returns:
-        Created user data
+        Данные созданного пользователя.
 
     Raises:
-        400: If user already exists
+        400: Пользователь с таким телефоном уже существует.
     """
     service = AuthService(db)
     try:
@@ -135,20 +168,22 @@ async def login(
     db: AsyncSession = Depends(get_db),
 ) -> TokenResponse:
     """
-    Login user and set JWT cookie.
+    Вход: выдаёт JWT в httpOnly-cookie + CSRF double-submit токен.
 
-    B.2.3: Sets SameSite=Strict cookie + CSRF double-submit token.
+    B.2.3: httpOnly не даёт JavaScript прочитать токен (защита от XSS),
+    SameSite=Strict ограничивает отправку cookie кросс-доменно. CSRF-токен
+    выдаётся заново при каждом логине. Неверные учётные данные → 401.
 
     Args:
-        credentials: Login credentials (phone, password)
-        response: FastAPI response for setting cookie
-        db: Database session
+        credentials: Учётные данные (phone, password).
+        response: Ответ FastAPI — сюда пишутся cookie.
+        db: Сессия БД.
 
     Returns:
-        JWT access token
+        JWT access token.
 
     Raises:
-        401: If credentials are invalid
+        401: Неверный телефон или пароль.
     """
     service = AuthService(db)
     try:
@@ -181,15 +216,16 @@ async def logout(
     response: Response,
 ) -> dict[str, str]:
     """
-    Logout user by clearing JWT cookie.
+    Выход: удаляет JWT- и CSRF-cookie.
 
-    B.2.3: Clears CSRF cookie too.
+    B.2.3: чистим обе cookie (access_token и csrf_token), иначе после логаута
+    остался бы действующий CSRF-токен, привязанный к старой сессии.
 
     Args:
-        response: FastAPI response for clearing cookie
+        response: Ответ FastAPI — для удаления cookie.
 
     Returns:
-        Success message
+        Сообщение об успешном выходе.
     """
     response.delete_cookie(
         key="access_token",
@@ -212,17 +248,21 @@ async def get_current_user(
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     """
-    Get current authenticated user.
+    Текущий аутентифицированный пользователь.
+
+    Токен берётся только из httpOnly-cookie (не из тела/заголовка), поэтому
+    эндпоинт работает автоматически для браузера. Отсутствие токена или
+    невалидный токен → 401 без раскрытия причины.
 
     Args:
-        request: HTTP request (for cookie access)
-        db: Database session
+        request: HTTP-запрос (для чтения cookie).
+        db: Сессия БД.
 
     Returns:
-        Current user data
+        Данные текущего пользователя.
 
     Raises:
-        401: If not authenticated
+        401: Нет токена или он невалиден.
     """
     token = request.cookies.get("access_token")
     if not token:

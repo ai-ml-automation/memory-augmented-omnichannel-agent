@@ -1,6 +1,17 @@
 """
-Prompt Builder
-Constructs prompts with context and memory for LLM
+Построитель промптов для LLM с контекстом из памяти пользователя.
+
+Формирует последовательность сообщений: системный промпт, контекст из памяти
+(релевантные факты), историю диалога и текущее сообщение. Здесь память
+превращается в контекст диалога.
+
+Ключевые решения:
+- контекст памяти идёт системным сообщением — LLM воспринимает факты как данность;
+- системный промпт зависит от канала (голос — кратко, мессенджеры — эмодзи):
+  формат ответа должен соответствовать каналу омниканальности;
+- извлечение фактов из ответа — эвристика без LLM-разбора: экономит токены.
+
+@see memory_search_service, LLMService
 """
 
 import logging
@@ -18,16 +29,35 @@ settings = get_settings()
 
 class PromptBuilder:
     """
-    Builds prompts for LLM with context from memory.
+    Сборка промптов для LLM с контекстом из памяти.
 
-    Components:
-    - System prompt (role, constraints)
-    - User context (name, preferences)
-    - Memory context (relevant facts)
-    - Current message
+    Ответственность: превратить идентификатор пользователя и его сообщение
+    в полный набор сообщений для LLM, обогащённый фактами из памяти.
+
+    Жизненный цикл: создаётся на каждый запрос (или переиспользуется
+    в рамках обработчика); внутри держит MemorySearchService для выборки
+    релевантных фактов.
+
+    Почему отдельный класс: сборка промпта — это бизнес-правило (что и как
+    показывать LLM), а не деталь LLM-клиента; разделение позволяет тестировать
+    сборку без реального LLM и менять формат промпта независимо от провайдера.
+
+    Компоненты: системный промпт, контекст памяти, история, текущее сообщение.
+
+    @see LLMService, MemorySearchService
     """
 
     def __init__(self, db: AsyncSession):
+        """
+        Инициализация построителя промптов.
+
+        Принимает асинхронную сессию БД и создаёт MemorySearchService:
+        выборка контекста памяти выполняется тем же экземпляром сессии,
+        чтобы не плодить подключения и не ломать транзакцию вызывающего кода.
+
+        Args:
+            db: асинхронная сессия SQLAlchemy
+        """
         self.db = db
         self.memory_search = MemorySearchService(db)
 
@@ -40,16 +70,21 @@ class PromptBuilder:
         **kwargs: Any,
     ) -> list[dict[str, str]]:
         """
-        Build complete prompt for LLM.
+        Сборка полного промпта для LLM.
+
+        Порядок сообщений важен: системный промпт и контекст памяти идут до
+        сообщения пользователя, чтобы LLM использовал факты как данность
+        при генерации ответа. Контекст памяти запрашивается асинхронно
+        через MemorySearchService (гибридный поиск) — см. get_memory_context.
 
         Args:
-            user_id: User identifier
-            message: User's message
-            channel_type: Channel type
-            max_memory_facts: Maximum memory facts to include
+            user_id: идентификатор пользователя
+            message: сообщение пользователя
+            channel_type: тип канала (влияет на системный промпт)
+            max_memory_facts: максимум фактов памяти в контексте
 
         Returns:
-            List of message dicts for LLM
+            список dict с ключами role и content для LLM
         """
         messages = []
 
@@ -77,13 +112,18 @@ class PromptBuilder:
 
     def _build_system_prompt(self, channel_type: str) -> str:
         """
-        Build system prompt.
+        Сборка системного промпта с правилами ассистента.
+
+        Правила зашиты в промпт, а не в код: менять поведение ассистента
+        (персонализация, 152-ФЗ, тон ответа) можно без релиза приложения.
+        Канал добавляет своё правило: голос требует кратких ответов
+        для озвучки, мессенджеры допускают умеренные эмодзи.
 
         Args:
-            channel_type: Channel type
+            channel_type: тип канала (text, VOICE, MAX, TG, VK)
 
         Returns:
-            System prompt string
+            строка системного промпта
         """
         base_prompt = """Вы - полезный ассистент компании. 
 Отвечайте на русском языке. Будьте вежливы и помогайте пользователю.
@@ -113,18 +153,24 @@ class PromptBuilder:
         **kwargs: Any,
     ) -> list[dict[str, str]]:
         """
-        Build prompt with conversation history.
+        Сборка промпта с историей диалога.
+
+        История ограничивается последними max_history сообщениями: полная
+        история не помещается в контекст LLM и размывает внимание модели.
+        Сообщения истории добавляются в исходном порядке, чтобы модель
+        сохранила причинно-следственную цепочку диалога; текущее сообщение
+        пользователя идёт последним.
 
         Args:
-            user_id: User identifier
-            message: Current message
-            history: Conversation history
-            channel_type: Channel type
-            max_history: Maximum history messages
-            max_memory_facts: Maximum memory facts
+            user_id: идентификатор пользователя
+            message: текущее сообщение пользователя
+            history: история диалога (список dict role/content)
+            channel_type: тип канала
+            max_history: максимум сообщений истории
+            max_memory_facts: максимум фактов памяти в контексте
 
         Returns:
-            List of message dicts
+            список dict с ключами role и content для LLM
         """
         messages = []
 
@@ -163,15 +209,19 @@ class PromptBuilder:
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         """
-        Extract potential facts from LLM response.
+        Извлечение потенциальных фактов из ответа LLM.
 
-        This is a simple heuristic; will be enhanced with LLM in Phase 4.3.
+        Простая эвристика: предложения с обращениями «ваш/ваша/вас/вам»
+        считаются фактами об интеракции (категория interaction, уверенность
+        0.5). Почему эвристика, а не LLM-разбор: бесплатный способ собрать
+        факты без доп. вызовов LLM; точность повышается в более поздних
+        фазах (планировался LLM-разбор в Phase 4.3).
 
         Args:
-            response: LLM response text
+            response: текст ответа LLM
 
         Returns:
-            List of potential facts
+            список потенциальных фактов (dict: content, category, confidence)
         """
         facts = []
 

@@ -1,11 +1,14 @@
 ﻿"""
-Right to be Forgotten Service
-152-FZ compliance: cascade deletion of all user data
+Right to be Forgotten Service: каскадное удаление данных пользователя
+по требованию 152-ФЗ (ст. 9 «право на забвение»).
 
-B.3.1: Deletes user data from all stores:
-- PostgreSQL (facts, consents, sessions, channel_bindings, user)
-- Qdrant (vector index)
-- Neo4j (knowledge graph)
+B.3.1: удаляет данные пользователя из всех хранилищ:
+- PostgreSQL (факты, согласия, сессии, привязки каналов, пользователь);
+- Qdrant (векторный индекс);
+- Neo4j (граф знаний).
+
+ПОЧЕМУ каскад обязателен: частичное удаление оставляет ПДн в
+непрофильных хранилищах — регулятор требует полного стирания.
 """
 
 import logging
@@ -21,9 +24,11 @@ logger = logging.getLogger(__name__)
 
 class RightToBeForgottenService:
     """
-    Service for Right to be Forgotten (152-FZ).
+    Сервис «права на забвение» (152-ФЗ, B.3.1).
 
-    Cascade-deletes all user data from PostgreSQL, Qdrant, and Neo4j.
+    Каскадно удаляет все данные пользователя из PostgreSQL, Qdrant
+    и Neo4j. Методы удаления внешних хранилищ деградируют мягко:
+    недоступность сервиса логируется, но не роняет транзакцию.
     """
 
     def __init__(self, db: AsyncSession):
@@ -35,17 +40,17 @@ class RightToBeForgottenService:
         source: str = "OPERATOR",
     ) -> dict[str, int | str]:
         """
-        Delete all user data across all stores.
+        Удалить все данные пользователя из всех хранилищ.
 
-        This is the main entry point for Right to be Forgotten.
-        Called when consent is revoked or user requests deletion.
+        Точка входа «права на забвение»: вызывается при отзыве
+        согласия или по запросу пользователя на удаление.
 
         Args:
-            user_id: User identifier
-            source: Audit source (OPERATOR, AI, USER_REQUEST)
+            user_id: Идентификатор пользователя
+            source: Источник для аудита (OPERATOR, AI, USER_REQUEST)
 
         Returns:
-            Summary dict with deletion counts per store
+            Словарь-сводка с числом удалений по каждому хранилищу
         """
         summary: dict[str, int | str] = {
             "user_id": str(user_id),
@@ -104,10 +109,13 @@ class RightToBeForgottenService:
 
     async def _delete_from_qdrant(self, fact_ids: list[uuid.UUID]) -> int:
         """
-        Delete facts from Qdrant vector store.
+        Удалить факты из векторного хранилища Qdrant.
+
+        Идемпотентно: пустой список возвращает 0; при недоступности
+        Qdrant (или отключённой памяти) — тоже 0, с логом-предупреждением.
 
         Returns:
-            Number of facts deleted
+            Число удалённых фактов
         """
         if not fact_ids:
             return 0
@@ -150,10 +158,13 @@ class RightToBeForgottenService:
         user_id: uuid.UUID,
     ) -> int:
         """
-        Delete facts and user node from Neo4j.
+        Удалить факты и узел пользователя из Neo4j.
+
+        Сначала DETACH DELETE рёбер HAS_FACT (удаляет факты), затем
+        сам узел User — порядок важен, иначе останутся «висячие» рёбра.
 
         Returns:
-            Number of fact nodes deleted
+            Число удалённых узлов фактов
         """
         if not fact_ids:
             return 0

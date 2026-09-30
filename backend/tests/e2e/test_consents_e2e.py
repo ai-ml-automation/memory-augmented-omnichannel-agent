@@ -1,7 +1,8 @@
 """
-E2E Tests for Consent Endpoints
-Tests consent grant, status, and revocation (GDPR RTBF).
-All endpoints require authentication via JWT cookie.
+E2E-тесты эндпоинтов согласий.
+
+Покрывают выдачу согласия (grant), проверку статуса и отзыв (revoke,
+RTBF по 152-ФЗ). Все эндпоинты требуют аутентификацию через JWT-cookie.
 """
 
 import pytest
@@ -9,7 +10,12 @@ from httpx import AsyncClient
 
 
 async def _register_and_login(client: AsyncClient, phone: str) -> None:
-    """Helper: register user and login to set the JWT cookie."""
+    """Регистрирует пользователя и логинит его, ставя JWT-cookie.
+
+    Args:
+        client: HTTP-клиент e2e-фикстуры.
+        phone: номер телефона пользователя (уникальный на тест).
+    """
     await client.post(
         "/auth/register",
         json={
@@ -25,7 +31,11 @@ async def _register_and_login(client: AsyncClient, phone: str) -> None:
 
 @pytest.mark.asyncio
 async def test_consent_grant(client: AsyncClient):
-    """POST /consents/grant -> 201 with created consent record."""
+    """Ловит сбой выдачи согласия: grant не создаёт активную запись.
+
+    Контракт /consents/grant: 201 + has_active_consent=True,
+    иначе согласие не фиксируется и чат-обработка незаконна.
+    """
     await _register_and_login(client, "+79991000001")
 
     resp = await client.post(
@@ -42,7 +52,11 @@ async def test_consent_grant(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_consent_status(client: AsyncClient):
-    """GET /consents/status -> 200 with consent status."""
+    """Ловит потерю статуса: /consents/status без ключа has_active_consent.
+
+    Статус согласий нужен UI и чат-сервису для проверки правомерности
+    обработки (152-ФЗ).
+    """
     await _register_and_login(client, "+79991000002")
 
     resp = await client.get("/consents/status")
@@ -53,7 +67,11 @@ async def test_consent_status(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_consent_revoke(client: AsyncClient):
-    """POST /consents/revoke -> 200 with revoked consent."""
+    """Ловит незакрытый отзыв: revoke не гасит активное согласие.
+
+    RTBF: после выдачи согласия и его отзыва has_active_consent
+    обязан стать False — иначе данные продолжают обрабатываться.
+    """
     await _register_and_login(client, "+79991000003")
 
     # Grant first, then revoke

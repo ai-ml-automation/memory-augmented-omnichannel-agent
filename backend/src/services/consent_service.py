@@ -1,8 +1,9 @@
 ﻿"""
-Consent Service
-152-FZ compliance: consent management
+Сервис управления согласием (152-ФЗ): выдача, отзыв, проверка статуса.
 
-B.3.2: revoke_consent now triggers RightToBeForgotten cascade deletion
+Основание обработки персональных данных по ст. 6 152-ФЗ — согласие субъекта.
+B.3.2: revoke_consent запускает каскадное удаление данных через
+RightToBeForgottenService (PostgreSQL, Qdrant, Neo4j).
 """
 
 import logging
@@ -18,7 +19,12 @@ logger = logging.getLogger(__name__)
 
 
 class ConsentService:
-    """Service for managing user consent (152-FZ)."""
+    """
+    Сервис согласий: grant/revoke/has/get.
+
+    Хранит историю согласий (не перезаписывает): отзыв помечает revoked_at,
+    что сохраняет аудит-след для 152-ФЗ. Активное согласие — запись без revoked_at.
+    """
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -30,15 +36,18 @@ class ConsentService:
         ip_address: str | None = None,
     ) -> Consent:
         """
-        Grant consent for data processing.
+        Выдача согласия на обработку данных.
 
         Args:
-            user_id: User identifier
-            channel: Channel type (MAX, TG, VK, VOICE)
-            ip_address: Client IP address
+            user_id: идентификатор пользователя
+            channel: канал (MAX, TG, VK, VOICE)
+            ip_address: IP клиента для аудита
 
         Returns:
-            Created Consent instance
+            созданная запись Consent
+
+        Raises:
+            ValueError: если пользователь не найден
         """
         # Check if user exists
         result = await self.db.execute(
@@ -67,14 +76,13 @@ class ConsentService:
         source: str = "OPERATOR",
     ) -> None:
         """
-        Revoke user consent and trigger Right to be Forgotten.
+        Отзыв согласия с каскадным удалением данных (B.3.2).
 
-        B.3.2: This now triggers cascade deletion of all user data
-        from PostgreSQL, Qdrant, and Neo4j.
-
+        Запускает RightToBeForgottenService.delete_user_data: удаление из
+        PostgreSQL, Qdrant и Neo4j — право на забвение (ст. 17 152-ФЗ).
         Args:
-            user_id: User identifier
-            source: Audit source (OPERATOR, AI, USER_REQUEST)
+            user_id: идентификатор пользователя
+            source: источник отзыва (OPERATOR, AI, USER_REQUEST)
         """
         # Find active consent
         result = await self.db.execute(
@@ -116,13 +124,11 @@ class ConsentService:
 
     async def has_active_consent(self, user_id: uuid.UUID) -> bool:
         """
-        Check if user has active consent.
-
+        Проверка активного согласия (запись без revoked_at).
         Args:
-            user_id: User identifier
-
+            user_id: идентификатор пользователя
         Returns:
-            True if active consent exists
+            True если активное согласие существует
         """
         result = await self.db.execute(
             select(Consent).where(
@@ -138,13 +144,13 @@ class ConsentService:
         self, user_id: uuid.UUID
     ) -> dict:
         """
-        Get consent status for user.
+        Статус согласия: последняя запись в истории.
 
+        Нет записей — признак «согласие не давалось» (не то же, что отзыв).
         Args:
-            user_id: User identifier
-
+            user_id: идентификатор пользователя
         Returns:
-            Dictionary with consent status
+            dict: has_active_consent, granted_at, revoked_at
         """
         result = await self.db.execute(
             select(Consent)

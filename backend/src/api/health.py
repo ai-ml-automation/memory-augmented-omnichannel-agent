@@ -1,6 +1,11 @@
 """
-Health Check Router
-Endpoint for checking service health
+Health-check роутер: общее состояние сервиса и его зависимостей.
+
+Один эндпоинт для liveness/readiness: каждый бэкенд-компонент проверяется
+отдельно и с таймаутом, чтобы одна упавшая зависимость (например, Redis)
+не вешала проверку. Итог — агрегированный статус: healthy только когда все
+компоненты в порядке, иначе degraded. По этому эндпоинту оркестратор
+(Docker/K8s) решает, перезапускать ли контейнер.
 """
 
 import logging
@@ -25,13 +30,19 @@ async def health_check(
     db: AsyncSession = Depends(get_db),
 ) -> HealthResponse:
     """
-    Health check endpoint.
+    Проверка здоровья всех зависимостей.
 
-    Checks:
-    - PostgreSQL connection (always)
-    - Redis connection (always)
-    - Qdrant connection (only when ENABLE_MEMORY=true)
-    - Neo4j connection (only when ENABLE_MEMORY=true)
+    PostgreSQL и Redis проверяются всегда — они обязательны. Qdrant и Neo4j
+    проверяются только при ENABLE_MEMORY=true: если память сознательно
+    выключена, недоступные вектора/граф не должны ронять статус сервиса.
+    Каждая проверка в try/except с таймаутом, поэтому сбой одной зависимости
+    не блокирует остальные. Итог: healthy (все ок) или degraded (есть сбои).
+
+    Args:
+        db: Сессия БД для проверки PostgreSQL.
+
+    Returns:
+        Общий статус и детали по каждому компоненту.
     """
     services: dict[str, str] = {}
 

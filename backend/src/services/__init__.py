@@ -1,6 +1,11 @@
 ﻿"""
-Services Package
-Business logic services
+Пакет бизнес-логики.
+
+Реэкспортирует публичные сервисы, чтобы потребители импортировали их из
+одного места (`from backend.src.services import AuthService`) вместо
+глубоких путей. Список __all__ фиксирует публичный контракт пакета:
+всё, что не перечислено, считается внутренним API и может меняться
+без предупреждения.
 """
 
 from backend.src.services.auth_service import AuthService
@@ -25,3 +30,4 @@ __all__ = [
     "FactService",
     "VectorStoreService",
 ]
+

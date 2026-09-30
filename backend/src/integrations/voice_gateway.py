@@ -1,6 +1,13 @@
 """
-Voice Gateway
-Integration with voice channels (SIP, WebRTC, telephony)
+Шлюз голосовых каналов (SIP, WebRTC, телефония).
+
+Назначение: единая точка интеграции голосовых каналов — входящие
+звонки, отправка аудио, завершение звонка и статусы.
+Почему два класса в одном модуле: VoiceGateway отвечает за жизненный
+цикл звонка (сигнализация), VoiceProcessor — за контентную обработку
+(ASR → память → LLM → TTS); это разные обязанности одной области.
+Почему гейт ENABLE_VOICE: без флага все методы возвращают failure
+без исключений — отключённый канал не должен ронять конвейер.
 """
 
 import logging
@@ -15,12 +22,16 @@ settings = get_settings()
 
 class VoiceGateway:
     """
-    Gateway for voice channel integration.
+    Шлюз голосовых каналов.
 
-    Supports:
-    - SIP (via OPAL/Opalvoip)
-    - WebRTC (via aiortc)
-    - Telephony providers (Marusia, SberStanza)
+    Поддерживаемые виды транспорта:
+    - SIP (через OPAL/Opalvoip)
+    - WebRTC (через aiortc)
+    - Телефонные провайдеры (Маруся, SberStanza)
+
+    Реализации методов — заглушки-стабы: интеграция с конкретными
+    провайдерами телефонии подключается позже (точки TODO), контракт
+    сигнализации (call_id, статусы) уже зафиксирован.
     """
 
     def __init__(self):
@@ -34,14 +45,20 @@ class VoiceGateway:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
-        Handle incoming voice call.
+        Обработать входящий звонок.
+
+        Почему call_id генерируется здесь: звонок должен иметь
+        идентификатор для последующих send_audio_response/end_call,
+        даже если провайдер его не прислал.
 
         Args:
-            caller_id: Caller identifier
-            call_id: Call identifier
+            caller_id: Идентификатор звонящего.
+            call_id: Идентификатор звонка (генерируется при отсутствии).
 
         Returns:
-            Call handling result
+            {success, call_id, caller_id, status} — при выключенном
+            ENABLE_VOICE возвращает {success: False, error: "Voice
+            disabled"} без исключений.
         """
         if not settings.ENABLE_VOICE:
             return {
@@ -80,14 +97,18 @@ class VoiceGateway:
         **kwargs: Any,
     ) -> bool:
         """
-        Send audio response to caller.
+        Отправить аудио-ответ звонящему.
+
+        Почему вход в байтах, а не файлом: аудио приходит из TTS в
+        памяти (WAV-bytes), и передача без записи на диск не оставляет
+        следов — приватность 152-ФЗ.
 
         Args:
-            call_id: Call identifier
-            audio_data: Audio data to send
+            call_id: Идентификатор звонка.
+            audio_data: Аудио-данные для отправки.
 
         Returns:
-            True if sent successfully
+            True при успешной отправке.
         """
         if not settings.ENABLE_VOICE:
             return False
@@ -108,13 +129,13 @@ class VoiceGateway:
         **kwargs: Any,
     ) -> bool:
         """
-        End voice call.
+        Завершить голосовой звонок.
 
         Args:
-            call_id: Call identifier
+            call_id: Идентификатор звонка.
 
         Returns:
-            True if ended successfully
+            True при успешном завершении.
         """
         if not settings.ENABLE_VOICE:
             return False
@@ -134,13 +155,17 @@ class VoiceGateway:
         call_id: str,
     ) -> dict[str, Any]:
         """
-        Get call status.
+        Получить статус звонка.
+
+        Заглушка: без интеграции с провайдером телефонии статус всегда
+        unknown с нулевой длительностью — контракт зафиксирован, данные
+        появятся после подключения реального транспорта.
 
         Args:
-            call_id: Call identifier
+            call_id: Идентификатор звонка.
 
         Returns:
-            Call status
+            {call_id, status, duration}.
         """
         return {
             "call_id": call_id,
@@ -151,8 +176,12 @@ class VoiceGateway:
 
 class VoiceProcessor:
     """
-    Processes voice messages through the full pipeline:
-    ASR → Memory Search → LLM → TTS
+    Обработка голосового сообщения полным конвейером:
+    ASR → поиск памяти → LLM → TTS (Phase C.3.3).
+
+    Пока генерация контента не подключена (TODO: поиск памяти и LLM),
+    ответ формируется эхом: «Вы сказали: <распознанный текст>» — чтобы
+    конвейер был проверяемым от ASR до TTS без внешних зависимостей.
     """
 
     def __init__(self, db: Any):
@@ -165,14 +194,20 @@ class VoiceProcessor:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
-        Process voice message.
+        Обработать голосовое сообщение.
+
+        Почему SpeechService импортируется внутри метода: сервис речи
+        тяжёлый (модели/клиенты SpeechKit), локальный импорт избегает
+        загрузки при импорте модуля — асинхронный конвейер не должен
+        платить за это на старте.
 
         Args:
-            audio_data: Voice message audio
-            caller_id: Caller identifier
+            audio_data: Аудио голосового сообщения.
+            caller_id: Идентификатор звонящего.
 
         Returns:
-            Processing result with audio response
+            {success, text, audio, confidence} при успехе; при сбое ASR —
+            {success: False, error} с причиной.
         """
         from backend.src.services.speech_service import SpeechService
 

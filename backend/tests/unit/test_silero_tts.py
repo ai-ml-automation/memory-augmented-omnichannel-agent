@@ -1,7 +1,11 @@
 """
 Unit Tests for SileroTTS Service (Phase D.3.2)
 
-Pure-mock tests — no actual model loading or GPU required.
+Pure-mock тесты синтеза речи — модель и GPU не требуются.
+
+Зачем эти тесты: TTS-канал зависит от torch и флага ENABLE_TTS.
+Тесты фиксируют graceful degradation (выключенный канал, отсутствующий
+torch) и успешный синтез WAV с корректными sample_rate и duration.
 """
 
 from unittest.mock import MagicMock, patch
@@ -13,12 +17,21 @@ _PATCH_TTS_SETTINGS = "backend.src.services.silero_tts.settings"
 
 
 class TestSileroTTS:
-    """Tests for SileroTTS synthesize (D.3.2)."""
+    """Группа тестов SileroTTS.synthesize (D.3.2).
+
+    Покрывают выключенный канал (ENABLE_TTS=False), отсутствующий
+    torch и успешный синтез WAV-аудио.
+    """
 
     @pytest.mark.asyncio
     @patch(_PATCH_TTS_SETTINGS)
     async def test_synthesize_disabled_returns_error(self, mock_settings):
-        """When ENABLE_TTS=False, synthesize returns error dict."""
+        """Ловит баг, если при ENABLE_TTS=False канал не отключается.
+
+        synthesize обязан вернуть success=False с audio=None и ошибкой
+        "disabled". Пропуск флага приведёт к загрузке torch/Silero
+        без необходимости и падению синтеза в проде.
+        """
         from backend.src.services.silero_tts import SileroTTS
 
         mock_settings.ENABLE_TTS = False
@@ -33,7 +46,12 @@ class TestSileroTTS:
     @pytest.mark.asyncio
     @patch(_PATCH_TTS_SETTINGS)
     async def test_synthesize_model_not_installed(self, mock_settings):
-        """When torch package is missing, RuntimeError is caught."""
+        """Ловит баг, если отсутствие torch роняет synthesize.
+
+        Когда модуль torch недоступен (patch.dict sys.modules),
+        synthesize обязан вернуть success=False с audio=None, а не
+        бросить исключение — TTS-канал деградирует мягко.
+        """
         from backend.src.services.silero_tts import SileroTTS
 
         mock_settings.ENABLE_TTS = True
@@ -50,7 +68,12 @@ class TestSileroTTS:
     @pytest.mark.asyncio
     @patch(_PATCH_TTS_SETTINGS)
     async def test_synthesize_success(self, mock_settings):
-        """When torch and Silero are mocked, WAV bytes are returned."""
+        """Ловит баг, если успешный синтез теряет WAV или метаданные.
+
+        При замоканных torch/Silero synthesize обязан вернуть success=True,
+        WAV-байты с сигнатурой RIFF, sample_rate=24000 и положительную
+        длительность — без них голосовой канал не отдаст аудио клиенту.
+        """
         from backend.src.services.silero_tts import SileroTTS
 
         mock_settings.ENABLE_TTS = True

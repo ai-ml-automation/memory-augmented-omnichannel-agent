@@ -1,6 +1,13 @@
 """
 Unit Tests for FactService
-Tests fact CRUD with encryption and consent checks (Phase B).
+Проверяют CRUD фактов: шифрование значения (AES-256-GCM), проверку согласия
+(consent), суперседию устаревших фактов, поиск по расшифрованным значениям
+и статистику по типам.
+
+Зачем эти тесты: факты — личные данные пользователя. Значение шифруется
+в БД, поэтому тесты ловят утечки открытого текста, сохранение без согласия,
+попадание устаревших фактов в активные выборки и сломанную расшифровку
+при чтении (Phase B).
 """
 
 import uuid
@@ -14,7 +21,15 @@ from backend.src.services.fact_service import FactService, VALID_FACT_TYPES
 
 
 async def _create_test_user(db: AsyncSession) -> User:
-    """Helper: create a test user."""
+    """Helper: создать тестового пользователя без обращения к AuthService.
+
+    Args:
+        db: активная тестовая сессия, в которую сохраняется пользователь.
+
+    Returns:
+        User: созданный пользователь с фейковыми хэшами телефона и пароля
+        (флашед, но не закоммиченный — транзакция откатится после теста).
+    """
     user = User(
         id=uuid.uuid4(),
         phone_hash="test_hash",
@@ -28,7 +43,15 @@ async def _create_test_user(db: AsyncSession) -> User:
 
 
 async def _grant_consent(db: AsyncSession, user: User) -> Consent:
-    """Helper: grant active consent for test user."""
+    """Helper: выдать активное согласие на обработку фактов.
+
+    Args:
+        db: активная тестовая сессия, в которую сохраняется согласие.
+        user: пользователь, которому выдаётся согласие.
+
+    Returns:
+        Consent: согласие на канал "TG", выданное 01.01.2025.
+    """
     consent = Consent(
         id=uuid.uuid4(),
         user_id=user.id,
@@ -46,7 +69,12 @@ async def _grant_consent(db: AsyncSession, user: User) -> Consent:
 
 @pytest.mark.asyncio
 async def test_store_fact_success(db_session: AsyncSession):
-    """Test storing a valid fact (encrypted, consent verified)."""
+    """Ловит баг, если store_fact не сохраняет валидный факт целиком.
+
+    После сохранения: id не пустой, value возвращается расшифрованным,
+    тип/вес/канал сохранены, is_superseded=False, проставлены created_at
+    и expires_at. Пропуск любого из этих полей сломает чтение факта.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -73,7 +101,12 @@ async def test_store_fact_success(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_store_fact_value_encrypted_in_db(db_session: AsyncSession):
-    """Test that value is actually encrypted in the database."""
+    """Ловит критический баг хранения открытого текста в БД.
+
+    Читает value сырым SQL в обход identity map и проверяет, что в БД
+    лежит НЕ исходный текст, а возвращаемый сервисом факт — расшифрован.
+    Если сервис писал plaintext, утечка БД раскрыла бы личные данные.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -105,7 +138,12 @@ async def test_store_fact_value_encrypted_in_db(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_store_fact_no_consent_raises(db_session: AsyncSession):
-    """Test that store_fact without consent raises PermissionError."""
+    """Ловит баг, если факт сохраняется без согласия пользователя.
+
+    Без выданного consent store_fact обязан бросить PermissionError
+    с "consent". Сохранение без согласия нарушает правила обработки
+    персональных данных — это защитная проверка Phase B.
+    """
     user = await _create_test_user(db_session)
     # No consent granted
     service = FactService(db_session)
@@ -121,7 +159,12 @@ async def test_store_fact_no_consent_raises(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_store_fact_invalid_type_raises(db_session: AsyncSession):
-    """Test that invalid fact type raises ValueError."""
+    """Ловит баг, если принимается неизвестный тип факта.
+
+    store_fact обязан бросить ValueError "Invalid fact type". Пропуск
+    валидации засорит БД типами, которые не обработают ни выборки,
+    ни статистика, ни рекомендации.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -137,7 +180,12 @@ async def test_store_fact_invalid_type_raises(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_store_fact_all_valid_types(db_session: AsyncSession):
-    """Test that all valid fact types can be stored."""
+    """Ловит баг, если хотя бы один валидный тип факта не сохраняется.
+
+    Перебирает весь список VALID_FACT_TYPES и проверяет, что тип
+    возвращённого факта совпадает с запрошенным. Пропуск типа здесь —
+    признак рассинхронизации валидации и модели хранения.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -158,7 +206,12 @@ async def test_store_fact_all_valid_types(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_get_facts(db_session: AsyncSession):
-    """Test retrieving facts for a user (decrypted)."""
+    """Ловит баг, если get_facts не возвращает все факты пользователя.
+
+    Хранит 3 факта разных типов и каналов, затем проверяет, что чтение
+    отдаёт все три значения расшифрованными. Пропущенный факт или
+    зашифрованный текст в ответе — регрессия чтения.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -179,7 +232,12 @@ async def test_get_facts(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_get_facts_by_type(db_session: AsyncSession):
-    """Test filtering facts by type."""
+    """Ловит баг, если фильтр fact_type игнорируется при чтении.
+
+    При 2 фактах "intent" и 1 "preference" запрос с fact_type="intent"
+    обязан вернуть ровно 2 факта, все типа intent. Игнорирование фильтра
+    вернёт лишние факты в карточку клиента.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -196,7 +254,12 @@ async def test_get_facts_by_type(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_get_fact_by_id(db_session: AsyncSession):
-    """Test getting a single fact by ID (decrypted)."""
+    """Ловит баг, если чтение одиночного факта не расшифровывает value.
+
+    Сохраняет факт с кириллическим адресом и читает его по id: значение
+    должно вернуться как plaintext. Сломанная расшифровка при чтении
+    проявится именно здесь — в полном round-trip шифрования.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -212,7 +275,12 @@ async def test_get_fact_by_id(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_get_fact_nonexistent_returns_none(db_session: AsyncSession):
-    """Test that get_fact returns None for non-existent ID."""
+    """Ловит баг, если get_fact для отсутствующего id бросает исключение.
+
+    Для случайного uuid сервис обязан вернуть None — отсутствие факта
+    это штатная ситуация, а не ошибка. Исключение здесь сломало бы
+    обработку «факт не найден» на уровне API.
+    """
     service = FactService(db_session)
     result = await service.get_fact(uuid.uuid4())
     assert result is None
@@ -224,7 +292,12 @@ async def test_get_fact_nonexistent_returns_none(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_supersede_fact(db_session: AsyncSession):
-    """Test superseding a fact."""
+    """Ловит баг, если суперседия не помечает факт устаревшим.
+
+    После supersede_fact факт обязан получить is_superseded=True и вес 0.1.
+    Устаревший факт не должен влиять на рекомендации с прежним весом —
+    иначе клиенту будут предлагать отменённые предпочтения.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -241,7 +314,12 @@ async def test_supersede_fact(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_delete_fact(db_session: AsyncSession):
-    """Test hard-deleting a fact."""
+    """Ловит баг, если hard-delete не удаляет факт из БД.
+
+    После delete_fact чтение по id должно вернуть None. Это основа права
+    на забвение (right to be forgotten): если запись переживёт удаление,
+    удалить персональные данные пользователя станет невозможно.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -261,7 +339,12 @@ async def test_delete_fact(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_search_facts(db_session: AsyncSession):
-    """Test searching facts by decrypted value text."""
+    """Ловит баг, если поиск по подстроке пропускает факты.
+
+    Поиск идёт по расшифрованным значениям в памяти: запрос "laptop"
+    обязан найти оба факта, содержащих это слово. Пропуск факта означает,
+    что оператор не увидит релевантную информацию о клиенте.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -280,7 +363,12 @@ async def test_search_facts(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_search_facts_case_insensitive(db_session: AsyncSession):
-    """Test search is case-insensitive."""
+    """Ловит баг, если поиск фактов регистрозависим.
+
+    Значение "LOVES COFFEE" должно находиться по запросу "coffee" —
+    пользователь не помнит, в каком регистре сохранён факт. Регистроза-
+    висимый поиск молча теряет результаты для операторов.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -298,7 +386,12 @@ async def test_search_facts_case_insensitive(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_get_user_stats(db_session: AsyncSession):
-    """Test user statistics."""
+    """Ловит баг, если статистика по типам фактов неверна.
+
+    После сохранения 2 "intent" и 1 "preference" статистика обязана быть
+    total=3, intent=2, preference=1, complaint=0. Сломанный счётчик
+    исказит сводку по клиенту на дашборде оператора.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)
@@ -317,7 +410,12 @@ async def test_get_user_stats(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_get_facts_excludes_superseded(db_session: AsyncSession):
-    """Test that get_facts excludes superseded facts by default."""
+    """Ловит баг, если устаревшие факты попадают в активные выборки.
+
+    active_only=True обязан вернуть только 1 активный факт из двух,
+    active_only=False — оба. Суперседия помечает, а не удаляет: история
+    должна оставаться доступной, но не влиять на активные данные.
+    """
     user = await _create_test_user(db_session)
     await _grant_consent(db_session, user)
     service = FactService(db_session)

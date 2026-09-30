@@ -1,6 +1,12 @@
 """
-VK Gateway
-Integration with VK via vk_api (Callback API)
+Шлюз VK (интеграция через vk_api, Callback API).
+
+Назначение: единая точка общения с VK — отправка исходящих сообщений
+и нормализация входящих событий Callback API.
+Почему vk_api-сессия ленивая: библиотека и токен доступа нужны только
+при реальной отправке, тяжёлая инициализация не задерживает старт.
+Почему гейт ENABLE_LLM: флаг используется как общий выключатель
+внешних интеграций — при его отключении сессия не создаётся.
 """
 
 import logging
@@ -13,7 +19,13 @@ settings = get_settings()
 
 
 class VKGateway:
-    """Gateway for VK integration."""
+    """
+    Шлюз VK (vk_api, Callback API).
+
+    Сессия VkApi создаётся лениво с токеном доступа из настроек.
+    Ошибки отправки не пробрасываются наверх: шлюз возвращает False,
+    чтобы диалоговый конвейер продолжал работу.
+    """
 
     def __init__(self):
         self._session = None
@@ -21,7 +33,12 @@ class VKGateway:
         self._group_id = settings.VK_GROUP_ID
 
     def _get_session(self) -> Any:
-        """Lazy initialization of VK session."""
+        """Ленивая инициализация VK-сессии.
+
+        Почему лениво: vk_api — опциональная зависимость, она
+        импортируется только при первой отправке. Отсутствующий пакет
+        превращается в RuntimeError с понятным текстом.
+        """
         if self._session is None:
             if not settings.ENABLE_LLM:
                 raise RuntimeError("VK integration disabled (ENABLE_LLM=false)")
@@ -43,15 +60,20 @@ class VKGateway:
         **kwargs: Any,
     ) -> bool:
         """
-        Send message to VK user.
+        Отправить сообщение пользователю VK.
+
+        Почему random_id: VK API требует уникальный идентификатор,
+        чтобы не отправлять дубли при сетевых ретраях; по умолчанию 0,
+        вызывающий может передать свой. Ключ извлекается из kwargs,
+        чтобы не уехать в **{...} как неизвестный параметр.
 
         Args:
-            user_id: User identifier
-            message: Message text
-            **kwargs: Additional parameters
+            user_id: Идентификатор пользователя VK.
+            message: Текст сообщения.
+            **kwargs: Дополнительные параметры.
 
         Returns:
-            True if sent successfully
+            True при успешной отправке.
         """
         if not settings.ENABLE_LLM:
             logger.warning("VK integration disabled, skipping send")
@@ -74,13 +96,18 @@ class VKGateway:
 
     async def get_webhook_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """
-        Parse incoming webhook data from VK (Callback API).
+        Разобрать входящий вебхук VK (Callback API).
+
+        Почему обработка и object.message, и самого object: Callback API
+        кладёт данные события в поле object, но в части событий это уже
+        готовое сообщение — схема должна переживать оба варианта.
 
         Args:
-            data: Raw webhook data
+            data: Сырое событие Callback API от VK.
 
         Returns:
-            Parsed message data
+            Нормализованная схема {channel, external_id, text,
+            message_id, timestamp} — единый контракт для message_handler.
         """
         object_data = data.get("object", {})
         message = object_data.get("message", {}) if isinstance(object_data, dict) else object_data

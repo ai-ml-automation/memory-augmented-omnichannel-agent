@@ -1,10 +1,18 @@
 """
-Vector Store Service
-Integration with Qdrant for vector similarity search (Phase D.1).
-Uses sentence-transformers for real embeddings.
+Сервис векторного поиска по фактам на базе Qdrant (Phase D.1).
 
-III.2: Dedicated ThreadPoolExecutor for embedding computation
-to prevent API thread exhaustion under high load.
+Реальные эмбеддинги считаются sentence-transformers: это позволяет находить
+семантически близкие факты, даже если в запросе нет общих ключевых слов.
+
+Ключевые решения:
+- выделенный ThreadPoolExecutor для эмбеддингов (III.2): инференс отпускает GIL,
+  поэтому не блокирует event loop FastAPI; 16 воркеров держат 50+ запросов;
+- ленивая инициализация клиента и модели — сервис стартует без Qdrant
+  и sentence-transformers (ENABLE_LLM=false);
+- поиск фильтруется по user_id: коллекция общая, а изоляция пользователей
+  обеспечивается фильтром запроса, а не отдельными коллекциями.
+
+@see memory_search_service (гибридный поиск), QDRANT_SEARCH_DURATION
 """
 
 import concurrent.futures
@@ -31,17 +39,44 @@ _embedding_executor = concurrent.futures.ThreadPoolExecutor(
 
 class VectorStoreService:
     """
-    Vector store service using Qdrant.
-    Phase D.1: Real embeddings via sentence-transformers.
+    Сервис векторного хранилища на базе Qdrant (Phase D.1).
+
+    Ответственность: индексация фактов реальными эмбеддингами и семантический
+    поиск по ним с фильтрацией по владельцу.
+
+    Жизненный цикл: один экземпляр на приложение; клиент Qdrant и модель
+    sentence-transformers создаются лениво при первой необходимости.
+
+    Почему Qdrant: выделенная векторная БД масштабируется независимо от
+    PostgreSQL и поддерживает фильтры по payload (user_id) на стороне поиска,
+    что сохраняет изоляцию данных пользователей.
+
+    @see memory_search_service, VectorStoreService.get_embedding
     """
 
     def __init__(self):
+        """
+        Инициализация сервиса без создания клиента и модели.
+
+        Клиент Qdrant и модель эмбеддингов инициализируются лениво
+        при первом обращении (_get_client/_get_model), чтобы приложение
+        могло стартовать без векторной БД и ML-зависимостей.
+        """
         self._client = None
         self._model = None
         self._collection = "facts"
 
     def _get_client(self) -> Any:
-        """Lazy initialization of Qdrant client."""
+        """
+        Ленивая инициализация клиента Qdrant.
+
+        Почему лениво: qdrant-client может быть не установлен, а сам Qdrant —
+        недоступен; сервис обязан стартовать (ENABLE_LLM=false) и сообщать
+        о недоступности хранилища только в момент реальной операции.
+
+        Raises:
+            RuntimeError: если хранилище отключено или пакет не установлен
+        """
         if self._client is None:
             if not settings.ENABLE_LLM:
                 raise RuntimeError("Vector store disabled (ENABLE_LLM=false)")
@@ -60,7 +95,16 @@ class VectorStoreService:
         return self._client
 
     def _get_model(self) -> Any:
-        """Lazy initialization of sentence-transformers model (Phase D.1)."""
+        """
+        Ленивая загрузка модели sentence-transformers (Phase D.1).
+
+        Модель (settings.EMBEDDING_MODEL) скачивается/загружается один раз
+        и переиспользуется: загрузка тяжёлая (сотни МБ), поэтому происходит
+        только при первой реальной потребности в эмбеддингах, а не при старте.
+
+        Raises:
+            RuntimeError: если эмбеддинги отключены или пакет не установлен
+        """
         if self._model is None:
             if not settings.ENABLE_LLM:
                 raise RuntimeError("Embeddings disabled (ENABLE_LLM=false)")
@@ -80,13 +124,19 @@ class VectorStoreService:
 
     async def get_embedding(self, text: str) -> list[float]:
         """
-        Generate embedding vector for text (Phase D.1).
+        Расчёт эмбеддинга для одного текста (Phase D.1).
+
+        Вычисление выносится в выделенный пул потоков _embedding_executor
+        (III.2): model.encode блокирует поток на время инференса, а пул
+        изолирует это от event loop FastAPI. normalize_embeddings=True
+        приводит векторы к единичной длине — косинусное сходство тогда
+        эквивалентно скалярному произведению.
 
         Args:
-            text: Input text
+            text: входной текст для векторизации
 
         Returns:
-            List of floats (embedding vector)
+            список float — вектор эмбеддинга
         """
         model = self._get_model()
         import asyncio
@@ -100,13 +150,17 @@ class VectorStoreService:
 
     async def get_embeddings(self, texts: list[str]) -> list[list[float]]:
         """
-        Generate embeddings for multiple texts (Phase D.1).
+        Расчёт эмбеддингов для списка текстов (Phase D.1).
+
+        Пакетная обработка (batch_size=32) заметно быстрее посимвольного
+        вызова get_embedding: модель эффективнее использует GPU/CPU на пакетах.
+        Как и одиночная версия, выполняется в выделенном пуле потоков (III.2).
 
         Args:
-            texts: List of input texts
+            texts: список текстов для векторизации
 
         Returns:
-            List of embedding vectors
+            список векторов эмбеддингов (по одному на текст)
         """
         model = self._get_model()
         import asyncio
@@ -126,16 +180,22 @@ class VectorStoreService:
         metadata: dict[str, Any] | None = None,
     ) -> bool:
         """
-        Index a fact with real embedding (Phase D.1).
+        Индексация факта в векторном хранилище с реальным эмбеддингом (Phase D.1).
+
+        user_id кладётся в payload точки: без него последующий search_similar
+        не смог бы отфильтровать результаты по владельцу, и пользователи
+        видели бы чужие факты. Метаданные распаковываются в payload, поэтому
+        могут переопределять служебные ключи — вызывающий код отвечает
+        за их корректность.
 
         Args:
-            fact_id: Fact identifier
-            user_id: User identifier
-            content: Fact content to embed
-            metadata: Optional metadata
+            fact_id: идентификатор факта (uuid)
+            user_id: идентификатор владельца факта
+            content: текст факта для эмбеддинга
+            metadata: дополнительные поля payload
 
         Returns:
-            True if indexed successfully
+            True, если факт проиндексирован (или хранилище отключено)
         """
         if not settings.ENABLE_LLM:
             logger.warning("Vector store disabled, skipping indexing")
@@ -175,15 +235,21 @@ class VectorStoreService:
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         """
-        Search for similar facts using real query embedding (Phase D.1).
+        Поиск фактов, похожих на запрос, реальным эмбеддингом запроса (Phase D.1).
+
+        Обязательный фильтр по user_id не даёт выдать факты другого
+        пользователя: векторная коллекция общая, и только фильтр запроса
+        обеспечивает изоляцию (privacy, 152-ФЗ). Длительность поиска всегда
+        фиксируется в метрике QDRANT_SEARCH_DURATION — включая ошибки,
+        поэтому наблюдение за метрикой видит и деградацию хранилища.
 
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
+            user_id: идентификатор пользователя (фильтр владельца)
+            query: поисковый запрос
+            limit: максимальное число результатов
 
         Returns:
-            List of similar facts with scores
+            список dict с ключами id, score, content, metadata
         """
         if not settings.ENABLE_LLM:
             logger.warning("Vector store disabled, skipping search")
@@ -232,13 +298,17 @@ class VectorStoreService:
 
     async def delete_fact(self, fact_id: uuid.UUID) -> bool:
         """
-        Delete fact from vector index.
+        Удаление факта из векторного индекса.
+
+        Вызывается каскадом из right_to_be_forgotten_service (RTBF, 152-ФЗ):
+        векторная копия факта должна удаляться вместе с записью в PostgreSQL,
+        иначе семантический поиск продолжит выдавать удалённые ПДн.
 
         Args:
-            fact_id: Fact identifier
+            fact_id: идентификатор факта
 
         Returns:
-            True if deleted
+            True, если факт удалён (или хранилище отключено)
         """
         if not settings.ENABLE_LLM:
             return False

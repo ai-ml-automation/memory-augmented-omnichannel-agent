@@ -1,6 +1,14 @@
 """
-SQLAlchemy Models
-All models in a single file as per CODING_STANDARDS.md
+SQLAlchemy-модели системы памяти омниканального агента.
+
+Все модели сосредоточены в одном файле по требованию CODING_STANDARDS.md:
+это упрощает обзор схемы БД и миграции, цена — больший файл.
+
+Ключевые решения:
+- телефон хранится только в виде хэша (phone_hash) — минимизация ПДн (152-ФЗ);
+- связи User → Consent/ChannelBinding/Session/Fact/AuditLog каскадные:
+  удаление пользователя удаляет все его данные (право на забвение);
+- JSONB-колонка context_json позволяет менять структуру без миграций.
 """
 
 import uuid
@@ -14,7 +22,16 @@ from backend.src.database import Base
 
 
 class User(Base):
-    """User model."""
+    """
+    Пользователь системы — владелец памяти, согласий и привязок каналов.
+
+    Создаётся при регистрации, удаляется каскадом со всеми данными по
+    запросу «право на забвение» (152-ФЗ).
+
+    Ключевые поля: phone_hash (хэш телефона вместо открытого номера),
+    role (user/operator/admin — доступ к админ-эндпоинтам),
+    jwt_version (инкремент инвалидирует старые JWT-токены).
+    """
 
     __tablename__ = "users"
 
@@ -27,7 +44,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(
         String(20), default="user"
     )  # user, operator, admin
-    jwt_version: Mapped[int] = mapped_column(Integer, default=1)
+    jwt_version: Mapped[int] = mapped_column(Integer, default=1)  # смена инвалидирует старые JWT
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=datetime.utcnow
     )
@@ -53,7 +70,15 @@ class User(Base):
 
 
 class Consent(Base):
-    """Consent model for 152-FZ compliance."""
+    """
+    Согласие пользователя на обработку данных по каналу (152-ФЗ).
+
+    Хранит историю grant/revoke, а не перезаписывает: revoked_at
+    фиксирует отзыв, новая запись создаётся при повторном согласии.
+
+    Ключевые поля: channel (MAX/TG/VK/VOICE), ip_address (адрес, с
+    которого дано согласие), granted_at/revoked_at (период действия).
+    """
 
     __tablename__ = "consents"
 
@@ -77,7 +102,15 @@ class Consent(Base):
 
 
 class ChannelBinding(Base):
-    """Channel binding model for omnichannel support."""
+    """
+    Привязка внешнего канала (MAX, TG, VK, VOICE) к пользователю.
+
+    Позволяет маршрутизировать сообщения из мессенджеров в сессию
+    нужного пользователя (омниканальность) и ограничивать число каналов.
+
+    Ключевые поля: channel_type (тип канала), external_id (идентификатор
+    собеседника в канале — telegram chat_id, vk user_id и т.п.).
+    """
 
     __tablename__ = "channel_bindings"
 
@@ -97,7 +130,15 @@ class ChannelBinding(Base):
 
 
 class Session(Base):
-    """Session model for tracking interactions."""
+    """
+    Сессия взаимодействия пользователя с агентом в одном канале.
+
+    Одна сессия объединяет последовательность сообщений и хранит
+    контекст разговора (context_json) для непрерывности диалога.
+
+    Ключевые поля: channel_type, started_at/ended_at (открыта/закрыта),
+    context_json (JSONB — гибкий контекст без миграций).
+    """
 
     __tablename__ = "sessions"
 
@@ -121,7 +162,15 @@ class Session(Base):
 
 
 class Fact(Base):
-    """Fact model for memory storage."""
+    """
+    Факт о пользователе — единица долговременной памяти агента.
+
+    Извлекается из сообщений, персонализирует ответы; weight и expires_at
+    реализуют затухание памяти, is_superseded отмечает замещение факта.
+
+    Ключевые поля: type (intent/preference/complaint/agreement/rejection/
+    personal_info), weight (важность), expires_at (устаревание).
+    """
 
     __tablename__ = "facts"
 
@@ -143,7 +192,7 @@ class Fact(Base):
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    is_superseded: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_superseded: Mapped[bool] = mapped_column(Boolean, default=False)  # True = факт замещён более актуальным
 
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="facts")
@@ -153,7 +202,15 @@ class Fact(Base):
 
 
 class AuditLog(Base):
-    """Audit log model for 152-FZ compliance."""
+    """
+    Журнал аудита доступа к данным (152-ФЗ).
+
+    Каждое действие чтения/записи/удаления фактов фиксируется для
+    доказуемости обработки; данные маскируются на уровне логирования.
+
+    Ключевые поля: action (READ/WRITE/DELETE), source (AI/OPERATOR),
+    fact_id (опциональная ссылка на факт), ip_address (инициатор).
+    """
 
     __tablename__ = "audit_logs"
 

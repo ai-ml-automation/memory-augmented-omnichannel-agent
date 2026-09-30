@@ -1,8 +1,17 @@
 """
-Celery tasks for periodic maintenance (DecayAgent).
+Периодическая задача обслуживания памяти: затухание и истечение фактов (III.1).
 
-III.1: Gradual memory decay — weight decreases by 1% per day
-instead of instant supersede at expiry.
+Запускается Celery Beat каждый час. Реализует постепенное затухание памяти:
+вес факта умножается на DECAY_FACTOR (0.99) — потеря 1% в день, вместо
+мгновенного вытеснения по истечении срока. Это соответствует III.1: память
+«забывается» плавно, а не исчезает целиком.
+
+Ключевые решения:
+- три механизма: постепенный decay, жёсткое истечение по expires_at,
+  мягкое по MIN_WEIGHT — покрывают старость, срок и низкую значимость;
+- одна UPDATE-операция на механизм (пакетно) — без чтения строк в Python;
+- задача без bind/retry: идемпотентна (повторное применение не ломает
+  состояние) — при сбое безопасно перезапустить вручную.
 """
 
 import logging
@@ -14,9 +23,10 @@ from backend.src.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 
-# III.1: Decay coefficient — weight multiplied by this factor each run
-DECAY_FACTOR = 0.99  # 1% weight reduction per day
-MIN_WEIGHT = 0.1     # Below this, fact is marked superseded
+# III.1: коэффициент затухания — вес умножается на него при каждом прогоне (1%/день)
+DECAY_FACTOR = 0.99
+# Ниже этого порога факт считается забытым — мягкое истечение
+MIN_WEIGHT = 0.1
 
 
 @celery_app.task(
@@ -24,15 +34,20 @@ MIN_WEIGHT = 0.1     # Below this, fact is marked superseded
 )
 def run_decay_agent() -> dict:
     """
-    Periodic task: gradual memory decay + hard expiry.
+    Применение затухания и истечения ко всем активным фактам.
 
-    Called every hour via Celery Beat.
-    1. Multiplies all active fact weights by DECAY_FACTOR (gradual decay).
-    2. Marks facts past expires_at as superseded (hard expiry).
-    3. Marks facts with weight < MIN_WEIGHT as superseded.
+    Почему пакетными UPDATE, а не построчно: фактов много, цикл в Python
+    медленный и создаёт лишнюю нагрузку на БД. Все три шага идемпотентны:
+    повторный прогон не ухудшает состояние (вес уже ≤ порога — строка
+    не попадает в UPDATE).
+
+    Порядок важен: сначала постепенный decay (все активные), затем жёсткое
+    истечение по expires_at, затем мягкое по весу. Истёкший факт помечается
+    superseded с весом MIN_WEIGHT, чтобы дальнейший decay его не трогал.
 
     Returns:
-        Dict with counts of decayed, hard-expired, and soft-expired facts.
+        dict: ``hard_expired`` — истекло по сроку, ``soft_expired`` — по весу,
+        ``total_expired`` — сумма (для метрики/лога)
     """
     import asyncio
     from backend.src.database import async_session_factory

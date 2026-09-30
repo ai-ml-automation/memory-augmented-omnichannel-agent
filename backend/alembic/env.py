@@ -1,4 +1,11 @@
 # backend/alembic/env.py
+"""
+Окружение Alembic для асинхронных миграций PostgreSQL.
+
+target_metadata = метаданные ORM-моделей (backend.src.models) — база для автогенерации.
+URL БД берётся из настроек приложения (get_settings), а не alembic.ini: единый
+источник конфигурации исключает расхождение приложения и миграций.
+"""
 import asyncio
 from logging.config import fileConfig
 
@@ -27,15 +34,11 @@ settings = get_settings()
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode.
+    """
+    Офлайн-режим: генерация SQL без подключения к БД.
 
-    This configures the context with just a URL
-    and not an Engine, though an Engine is acceptable
-    here as well. By skipping the Engine creation
-    we don't even need a DBAPI to be available.
-
-    Calls to context.execute() here emit the given string to the
-    script output.
+    Использует URL из настроек и literal_binds=True, поэтому скрипт выполним
+    вручную (psql) — удобно для ревью и продакшен-применения без engine.
     """
     context.configure(
         url=settings.postgres_url,
@@ -49,6 +52,12 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection):
+    """
+    Общий прогон миграций для переданного соединения.
+
+    Разделяет создание соединения (async-обёртка) и выполнение миграций,
+    чтобы контекст Alembic настраивался один раз в одном месте.
+    """
     context.configure(connection=connection, target_metadata=target_metadata)
 
     with context.begin_transaction():
@@ -56,7 +65,12 @@ def do_run_migrations(connection):
 
 
 async def run_async_migrations() -> None:
-    """Run migrations in 'online' mode with async engine."""
+    """
+    Онлайн-режим: выполнение миграций через async-движок.
+
+    NullPool: миграции не должны держать постоянный пул соединений — каждая
+    операция получает соединение независимо, как при разовой утилите.
+    """
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
@@ -70,7 +84,12 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
-    """Run migrations in 'online' mode."""
+    """
+    Входная точка онлайн-режима: запуск асинхронного прогона.
+
+    asyncio.run используется потому, что Alembic синхронный, а движок приложения
+    async — нужен временный event loop, который закрывается после миграций.
+    """
     asyncio.run(run_async_migrations())
 
 

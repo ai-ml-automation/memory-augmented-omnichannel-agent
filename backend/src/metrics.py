@@ -1,5 +1,15 @@
 ﻿"""
-Custom Prometheus metrics for business monitoring.
+Пользовательские метрики Prometheus для бизнес-мониторинга (F.1.1).
+
+Помимо стандартных HTTP-метрик instrumentator, здесь собраны бизнес-метрики:
+- LLM_REQUEST_DURATION — латентность запросов к LLM по провайдеру/модели;
+- QDRANT_SEARCH_DURATION — латентность векторного поиска по коллекциям;
+- FACTS_EXTRACTED_TOTAL — сколько фактов извлечено из сообщений по каналам;
+- CONFLICTS_DETECTED_TOTAL — обнаруженные конфликты памяти по резолюциям;
+- MEMORY_STORE_DURATION — латентность операций записи в хранилище памяти.
+
+Бакеты гистограмм подобраны под типичные диапазоны (LLM — секунды,
+поиск/память — десятки миллисекунд). Метрики экспонируются на /metrics.
 """
 
 from prometheus_client import Counter, Histogram

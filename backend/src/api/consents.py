@@ -1,8 +1,11 @@
 ﻿"""
-Consents Router
-Endpoints for consent management (152-FZ)
+Роутер согласий: управление согласием на обработку данных (152-ФЗ).
 
-B.3.2: Added data deletion endpoint (Right to be Forgotten)
+Все эндпоинты требуют авторизации — управлять согласием может только сам
+пользователь (через httpOnly-cookie с токеном доступа). B.3.2: помимо
+grant/revoke есть отдельный явный эндпоинт полного удаления данных
+(«право быть забытым»), а отзыв согласия автоматически запускает каскадное
+удаление из всех хранилищ.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -24,7 +27,13 @@ async def get_current_user_from_cookie(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
-    """Dependency to get current user from cookie."""
+    """Dependency: текущий пользователь из cookie с токеном доступа.
+
+    FastAPI-зависимость, переиспользуемая всеми эндпоинтами роутера: читает
+    токен из cookie (не из заголовка — так безопаснее при XSS), валидирует
+    его через AuthService и отдаёт данные пользователя. Ошибки авторизации
+    всегда 401, без раскрытия причины.
+    """
     token = request.cookies.get("access_token")
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -44,7 +53,13 @@ async def get_current_user_from_cookie(
 
 
 class DataDeletionResponse(BaseModel):
-    """Response for data deletion request."""
+    """Итог «права быть забытым»: что и откуда удалено.
+
+    Счётчики по каждому хранилищу отдельно — пользователь видит прозрачный
+    результат удаления, а не просто «ок»; user_deleted показывает, что удалён
+    и сам аккаунт.
+    """
+
     status: str
     postgres_facts_deleted: int
     qdrant_facts_deleted: int
@@ -59,17 +74,21 @@ async def grant_consent(
     db: AsyncSession = Depends(get_db),
 ) -> ConsentResponse:
     """
-    Grant consent for data processing.
+    Выдать согласие на обработку данных.
 
-    Requires authentication.
+    ﻿201 (создан ресурс), а не 200 — согласие фиксируется как отдельная запись
+    с каналом и IP (откуда получено), что требуется для аудита по 152-ФЗ.
 
     Args:
-        consent_data: Consent data (channel, ip_address)
-        current_user: Current authenticated user
-        db: Database session
+        consent_data: Данные согласия (канал, IP).
+        current_user: Аутентифицированный пользователь.
+        db: Сессия БД.
 
     Returns:
-        Consent status after grant
+        Статус согласия после выдачи.
+
+    Raises:
+        400: Некорректные данные согласия.
     """
     service = ConsentService(db)
     try:
@@ -90,19 +109,22 @@ async def revoke_consent(
     db: AsyncSession = Depends(get_db),
 ) -> ConsentResponse:
     """
-    Revoke user consent and trigger Right to be Forgotten.
+    Отозвать согласие — с каскадным удалением данных (B.3.2).
 
-    B.3.2: Revoking consent now cascade-deletes all user data
-    from PostgreSQL, Qdrant, and Neo4j.
-
-    Requires authentication.
+    Отзыв согласия теперь не просто флаг, а триггер полного удаления всех
+    данных пользователя из PostgreSQL, Qdrant и Neo4j через
+    RightToBeForgottenService: обработка без согласия запрещена 152-ФЗ,
+    поэтому данные обязаны реально исчезнуть, а не остаться «в архиве».
 
     Args:
-        current_user: Current authenticated user
-        db: Database session
+        current_user: Аутентифицированный пользователь.
+        db: Сессия БД.
 
     Returns:
-        Consent status after revoke
+        Статус согласия после отзыва.
+
+    Raises:
+        400: Ошибка при отзыве согласия.
     """
     service = ConsentService(db)
     try:
@@ -122,16 +144,17 @@ async def get_consent_status(
     db: AsyncSession = Depends(get_db),
 ) -> ConsentResponse:
     """
-    Get current consent status.
+    Текущий статус согласия пользователя.
 
-    Requires authentication.
+    Только чтение — не требует никаких изменений, поэтому GET. По статусу
+    фронтенд решает, можно ли обрабатывать данные (например, включать память).
 
     Args:
-        current_user: Current authenticated user
-        db: Database session
+        current_user: Аутентифицированный пользователь.
+        db: Сессия БД.
 
     Returns:
-        Current consent status
+        Текущий статус согласия.
     """
     service = ConsentService(db)
     status = await service.get_consent_status(current_user.id)
@@ -147,23 +170,23 @@ async def request_data_deletion(
     db: AsyncSession = Depends(get_db),
 ) -> DataDeletionResponse:
     """
-    Request Right to be Forgotten (152-FZ).
+    Явный запрос «права быть забытым» (152-ФЗ).
 
-    B.3.2: Dedicated endpoint for user-initiated data deletion.
-    Deletes all user data from PostgreSQL, Qdrant, and Neo4j.
-
-    This is the explicit "right to erasure" endpoint.
-    Consent revocation (/consents/revoke) also triggers this
-    automatically.
-
-    Requires authentication.
+    B.3.2: выделенный эндпоинт — пользователь может потребовать удаления
+    данных, не отзывая согласие формально. Удаляет всё из PostgreSQL, Qdrant
+    и Neo4j через RightToBeForgottenService и возвращает счётчики по каждому
+    хранилищу. Отзыв согласия (/consents/revoke) запускает тот же процесс
+    автоматически.
 
     Args:
-        current_user: Current authenticated user
-        db: Database session
+        current_user: Аутентифицированный пользователь.
+        db: Сессия БД.
 
     Returns:
-        Deletion summary with counts per store
+        Сводка удаления: сколько фактов удалено из каждого хранилища.
+
+    Raises:
+        500: Сбой процесса удаления данных.
     """
     rtbf = RightToBeForgottenService(db)
     try:

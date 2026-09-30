@@ -1,8 +1,10 @@
 ﻿"""
-Tests for Webhook Security (Phase B.2.1, B.2.2)
+Юнит-тесты безопасности вебхуков Telegram (B.2.1) и VK (B.2.2).
 
-B.2.1: Telegram X-Telegram-Bot-Api-Secret-Token verification
-B.2.2: VK Callback API secret parameter verification
+Проверяют проверку секретов: валидный секрет принимается, неверный и
+отсутствующий дают 403, пустая конфигурация отключает проверку (dev-режим),
+confirmation VK работает без проверки секрета, а сравнение секретов идёт
+через hmac.compare_digest (constant-time, защита от timing-атак).
 """
 
 import hmac
@@ -21,7 +23,11 @@ from backend.src.api.webhooks import (
 
 @pytest.fixture
 def app():
-    """Create a test FastAPI app with webhook router."""
+    """Создаёт тестовое FastAPI-приложение с роутером вебхуков.
+
+    Ловит баги настройки роутера: отсутствие include_router сразу валит все
+    HTTP-тесты (404 вместо проверки секрета).
+    """
     test_app = FastAPI()
     test_app.include_router(router)
     return test_app
@@ -29,7 +35,10 @@ def app():
 
 @pytest.fixture
 def client(app):
-    """Create a test client."""
+    """Создаёт тестовый клиент поверх приложения.
+
+    Изолирует HTTP-слой: без реального сервера тесты детерминированы.
+    """
     return TestClient(app)
 
 
@@ -39,10 +48,19 @@ def client(app):
 
 
 class TestTelegramSecretVerification:
-    """Tests for Telegram webhook secret token verification."""
+    """
+    Проверка X-Telegram-Bot-Api-Secret-Token на /webhook/telegram.
+
+    Ловит баги: пропуск проверки секрета, неверный статус при отклонении
+    (403 вместо 400), отключение проверки при пустом секрете и использование
+    обычного == вместо constant-time сравнения (timing-атака).
+    """
 
     def test_valid_secret_accepted(self, client):
-        """Request with correct secret token should be accepted (200 or 400 for bad data)."""
+        """
+        Валидный секрет-токен не даёт 403 (проходит проверку).
+        Ловит ложное отклонение легитимного запроса вебхука Telegram.
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.TELEGRAM_WEBHOOK_SECRET = "my-secure-token"
             mock_settings.TELEGRAM_BOT_TOKEN = "test-token"
@@ -56,7 +74,10 @@ class TestTelegramSecretVerification:
             assert response.status_code != 403
 
     def test_invalid_secret_rejected(self, client):
-        """Request with wrong secret token should return 403."""
+        """
+        Неверный секрет-токен отклоняется с 403 Forbidden.
+        Ловит баг отсутствия проверки: чужой секрет не должен проходить.
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.TELEGRAM_WEBHOOK_SECRET = "my-secure-token"
 
@@ -69,7 +90,10 @@ class TestTelegramSecretVerification:
             assert response.json()["detail"] == "Forbidden"
 
     def test_missing_secret_rejected(self, client):
-        """Request without secret token header should return 403 when configured."""
+        """
+        Запрос без заголовка секрета отклоняется 403, если секрет задан.
+        Ловит баг принятия запросов без токена (открытый вебхук).
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.TELEGRAM_WEBHOOK_SECRET = "my-secure-token"
 
@@ -81,7 +105,11 @@ class TestTelegramSecretVerification:
             assert response.status_code == 403
 
     def test_empty_secret_config_skips_verification(self, client):
-        """When TELEGRAM_WEBHOOK_SECRET is empty, verification is skipped (dev mode)."""
+        """
+        Пустой секрет в конфиге отключает проверку (dev-режим): 400, не 403.
+        Ловит баг жёсткой проверки при незаполненной конфигурации — вебхук
+        Telegram требует секрет всегда, в dev без него должен быть 400.
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.TELEGRAM_WEBHOOK_SECRET = ""
             mock_settings.TELEGRAM_BOT_TOKEN = "test-token"
@@ -94,7 +122,10 @@ class TestTelegramSecretVerification:
             assert response.status_code == 400
 
     def test_secret_comparison_is_timing_safe(self):
-        """Verify hmac.compare_digest is used (constant-time comparison)."""
+        """
+        Функция проверки секрета использует hmac.compare_digest.
+        Код-ревью тест: обычное == уязвимо к timing-атаке по секрету.
+        """
         # This is a code review test - verify the function uses compare_digest
         import inspect
         source = inspect.getsource(_verify_telegram_secret)
@@ -107,10 +138,19 @@ class TestTelegramSecretVerification:
 
 
 class TestVKSsecretVerification:
-    """Tests for VK Callback API secret parameter verification."""
+    """
+    Проверка секрета VK Callback API на /webhook/vk.
+
+    Ловит баги: пропуск проверки секрета, неверный статус отклонения,
+    блокировку confirmation без секрета (ломает первичную настройку VK)
+    и пустую конфигурацию, дающую 403 вместо 400.
+    """
 
     def test_valid_vk_secret_accepted(self, client):
-        """Request with correct VK secret should be accepted."""
+        """
+        Валидный VK-секрет в теле запроса проходит проверку (не 403).
+        Ловит ложное отклонение легитимного callback-запроса VK.
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.VK_CALLBACK_SECRET = "vk-secret-123"
             mock_settings.VK_GROUP_ID = "12345"
@@ -122,7 +162,10 @@ class TestVKSsecretVerification:
             assert response.status_code != 403
 
     def test_invalid_vk_secret_rejected(self, client):
-        """Request with wrong VK secret should return 403."""
+        """
+        Неверный VK-секрет отклоняется с 403.
+        Ловит баг отсутствия проверки: чужой секрет не должен проходить.
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.VK_CALLBACK_SECRET = "vk-secret-123"
 
@@ -133,7 +176,10 @@ class TestVKSsecretVerification:
             assert response.status_code == 403
 
     def test_missing_vk_secret_rejected(self, client):
-        """Request without VK secret should return 403 when configured."""
+        """
+        Callback без VK-секрета отклоняется 403, если секрет настроен.
+        Ловит баг приёма callback-запросов без секрета (подделка событий).
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.VK_CALLBACK_SECRET = "vk-secret-123"
 
@@ -144,7 +190,11 @@ class TestVKSsecretVerification:
             assert response.status_code == 403
 
     def test_confirmation_without_secret_check(self, client):
-        """VK confirmation request should work even without secret (initial setup)."""
+        """
+        Confirmation VK обрабатывается без проверки секрета (первичная настройка).
+        Ловит баг блокировки confirmation — VK требует его при подключении,
+        секрет ещё не прислан, без этого теста вебхук нельзя настроить.
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.VK_CALLBACK_SECRET = "vk-secret-123"
             mock_settings.VK_GROUP_ID = "12345"
@@ -158,7 +208,10 @@ class TestVKSsecretVerification:
             assert response.json() == {"response": "12345"}
 
     def test_empty_vk_secret_config_skips_verification(self, client):
-        """When VK_CALLBACK_SECRET is empty, verification is skipped."""
+        """
+        Пустой VK_CALLBACK_SECRET отключает проверку: 400 (bad data), не 403.
+        Ловит баг вечного 403 при незаполненной конфигурации секрета.
+        """
         with patch("backend.src.api.webhooks.settings") as mock_settings:
             mock_settings.VK_CALLBACK_SECRET = ""
             mock_settings.VK_GROUP_ID = "12345"
@@ -171,7 +224,10 @@ class TestVKSsecretVerification:
             assert response.status_code == 400
 
     def test_vk_secret_comparison_is_timing_safe(self):
-        """Verify hmac.compare_digest is used for VK secret."""
+        """
+        Функция проверки VK-секрета использует hmac.compare_digest.
+        Код-ревью тест: сравнение через == даёт утечку по таймингу.
+        """
         import inspect
         source = inspect.getsource(_verify_vk_secret)
         assert "compare_digest" in source

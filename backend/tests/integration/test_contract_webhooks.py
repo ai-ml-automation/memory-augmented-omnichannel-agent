@@ -1,16 +1,29 @@
 """
-Contract tests for webhook payload parsing.
-Phase E.3: Verify parsing matches real messenger payloads.
+Контрактные тесты структуры webhook-пейлоадов (Phase E.3).
+
+Фиксируют формат реальных пейлоадов Telegram, VK Callback API
+и MAX: набор обязательных полей и их вложенность. Ловят расхождение
+между тем, что присылают каналы, и тем, что ожидает парсер
+вебхуков (E.3), — без реальных запросов к мессенджерам.
 """
 
 import pytest
 
 
 class TestWebhookContracts:
-    """Contract tests for webhook payload parsing (Phase E.3)."""
+    """Группа контрактных тестов пейлоадов вебхуков трёх каналов.
+
+    Покрывают структуру реальных update Telegram, событий VK Callback
+    API и MAX: обязательные поля и вложенность. Фиксируют контракт
+    между мессенджерами и парсером вебхуков (E.3).
+    """
 
     def test_telegram_message_payload_structure(self):
-        """Verify Telegram message payload structure matches API spec."""
+        """Ловит смену структуры update Telegram: парсер вебхуков сломается.
+
+        Реальный update Bot API содержит update_id и message с полями
+        message_id/from/chat/text; from.id равен chat.id в приватном чате.
+        """
         # Real Telegram update structure
         payload = {
             "update_id": 123456789,
@@ -47,7 +60,11 @@ class TestWebhookContracts:
         assert msg["from"]["id"] == msg["chat"]["id"]
 
     def test_vk_callback_payload_structure(self):
-        """Verify VK Callback API payload structure."""
+        """Ловит смену структуры VK Callback API: message_new не распарсится.
+
+        Событие message_new несёт object.message с полями
+        text/from_id/peer_id; отправитель и чат в VK — разные сущности.
+        """
         payload = {
             "type": "message_new",
             "object": {
@@ -71,7 +88,11 @@ class TestWebhookContracts:
         assert "from_id" in payload["object"]["message"]
 
     def test_max_webhook_payload_structure(self):
-        """Verify MAX messenger webhook payload structure."""
+        """Ловит смену структуры MAX: событие message не распарсится.
+
+        MAX оборачивает сообщение в payload.message, чат — в payload.chat
+        с chatId; вложенность отличается от Telegram/VK.
+        """
         payload = {
             "event": "message",
             "payload": {
@@ -93,7 +114,12 @@ class TestWebhookContracts:
         assert "text" in payload["payload"]["message"]
 
     def test_webhook_payloads_are_json_serializable(self):
-        """Verify all webhook payloads can be serialized to JSON."""
+        """Ловит не-сериализуемые типы: пейлоад сломает JSON-транспорт.
+
+        Все три канала доставляют вебхуки как JSON, поэтому любой
+        не-сериализуемый объект (datetime/bytes/и т.п.) обрушит
+        доставку ещё до парсинга.
+        """
         import json
 
         payloads = [

@@ -1,6 +1,16 @@
 """
-Voice Service
-Business logic for voice processing pipeline (Phase C.3.3).
+Голосовой сценарий (Phase C.3.3): аудио → текст → ответ → аудио.
+
+Полный конвейер: распознавание речи (SpeechService/ASR) → поиск памяти →
+генерация ответа (LLMService) → синтез речи (SpeechService/TTS).
+
+Ключевые решения:
+- отдельный сервис от текстового чата: голосовой поток имеет свои форматы
+  (audio bytes) и шаги (ASR/TTS), но переиспользует LLM и память;
+- при отключённом ENABLE_VOICE возвращается словарь ошибки, а не исключение —
+  API канала не должен падать из-за конфигурации;
+- невалидный caller_id не роняет сценарий: память пропускается, диалог идёт
+  без контекста.
 """
 
 import logging
@@ -19,9 +29,24 @@ settings = get_settings()
 
 
 class VoiceService:
-    """Voice processing pipeline: ASR -> Memory -> LLM -> TTS (Phase C.3.3)."""
+    """
+    Оркестратор голосового сценария (Phase C.3.3).
+
+    Жизненный цикл: создаётся с сессией БД на время запроса; собирает
+    SpeechService (ASR/TTS), MemorySearchService (контекст) и LLMService.
+
+    Почему композиция, а не наследование: голосовой поток отличается от
+    текстового только форматами входа/выхода и шагами ASR/TTS — бизнес-логика
+    ответа и памяти переиспользуется через те же сервисы.
+    """
 
     def __init__(self, db: AsyncSession) -> None:
+        """
+        Создание голосового сервиса с сессией БД.
+
+        Зависимости (SpeechService, MemorySearchService, LLMService) создаются
+        один раз на запрос; сессия используется для поиска памяти пользователя.
+        """
         self.db = db
         self.speech_service = SpeechService()
         self.memory_search = MemorySearchService(db)
@@ -34,12 +59,22 @@ class VoiceService:
         language: str = "ru-RU",
     ) -> dict[str, Any]:
         """
-        Process voice message through the full pipeline.
+        Обработка голосового сообщения полным конвейером.
 
-        ASR -> MemorySearch -> LLM -> TTS
+        Шаги: ASR (речь → текст) → поиск памяти (если caller_id валидный UUID) →
+        генерация ответа LLM → TTS (текст → аудио). Память подмешивается в промпт
+        как контекст, чтобы ответ учитывал прошлые диалоги пользователя.
+
+        Ошибки на любом шаге не роняют запрос: возвращается словарь с success=False
+        и текстом ошибки — канал может ответить пользователю корректным сообщением.
+
+        Args:
+            audio_data: аудио в байтах (PCM/WAV/OGG)
+            caller_id: идентификатор пользователя (строка UUID)
+            language: код языка распознавания (ru-RU по умолчанию)
 
         Returns:
-            Dict with text, audio, confidence, error
+            dict: success, text, audio (синтезированный), confidence, error
         """
         if not settings.ENABLE_VOICE:
             return {"success": False, "error": "Voice processing disabled"}

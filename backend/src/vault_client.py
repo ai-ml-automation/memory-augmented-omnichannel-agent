@@ -1,7 +1,14 @@
 """
-Vault Client
-Reads secrets from HashiCorp Vault in production.
-Falls back to .env in development mode.
+Клиент HashiCorp Vault (KV v2) для хранения секретов в production.
+
+Зачем Vault: секреты (JWT, ключи шифрования) не лежат в env-переменных и
+не попадают в репозиторий; в development Vault пропускается — значения
+берутся из .env через Settings.
+
+Ключевые решения:
+- ленивый синглтон get_vault_client — hvac не обязателен для запуска;
+- get_vault_secret возвращает None при любой ошибке — приложение работает
+  с fallback-значениями, а не падает.
 """
 
 import logging
@@ -12,7 +19,15 @@ _vault_client = None
 
 
 def get_vault_client():
-    """Get or create Vault client singleton."""
+    """
+    Получение (и создание при первом вызове) синглтона Vault-клиента.
+
+    Почему лениво: hvac — опциональная зависимость, а в development Vault
+    не нужен вовсе, поэтому инициализация откладывается до первого чтения.
+
+    Returns:
+        hvac.Client при успешной аутентификации, иначе None (Vault отключён)
+    """
     global _vault_client
     if _vault_client is not None:
         return _vault_client
@@ -48,7 +63,16 @@ def get_vault_client():
 
 
 def get_vault_secret(path: str, key: str) -> str | None:
-    """Read a secret from Vault KV v2. Returns None on any failure."""
+    """
+    Чтение секрета из Vault KV v2; при любой ошибке — None.
+    None позволяет вызывающему коду перейти на fallback из .env,
+    а не упасть (правило «Vault недоступен — приложение живо»).
+    Args:
+        path: путь секрета в KV v2 (например, secret/omnichannel)
+        key: имя ключа внутри секрета
+    Returns:
+        значение секрета или None
+    """
     client = get_vault_client()
     if client is None:
         return None

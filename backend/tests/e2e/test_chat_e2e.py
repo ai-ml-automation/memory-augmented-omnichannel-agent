@@ -1,7 +1,9 @@
 """
-E2E Tests for Chat Endpoints
-Tests chat send, chat health, and response evaluation.
-Mock settings.ENABLE_LLM to control LLM behavior.
+E2E-тесты чат-эндпоинтов.
+
+Покрывают отправку сообщения (с согласием на обработку — 152-ФЗ),
+health чат-сервиса (провайдер LLM выключен по умолчанию) и оценку
+ответа. Мок settings.ENABLE_LLM управляет поведением LLM.
 """
 
 from unittest.mock import patch
@@ -12,7 +14,11 @@ from httpx import AsyncClient
 
 @pytest.mark.asyncio
 async def test_chat_send_message(client: AsyncClient):
-    """POST /chat/users/{id}/message -> 200 with response."""
+    """Ловит сбой отправки: сообщение не получает ответ и оценку.
+
+    Контракт /chat/users/{id}/message: 200 + response, evaluation
+    и facts_stored; без согласия на messaging чат обязан отклоняться.
+    """
     # Register and login to get auth cookie
     register_resp = await client.post(
         "/auth/register",
@@ -40,7 +46,11 @@ async def test_chat_send_message(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_chat_health(client: AsyncClient):
-    """GET /chat/health -> 200 with provider info (LLM disabled by default)."""
+    """Ловит поломку health: чат-сервис не сообщает о состоянии LLM.
+
+    /chat/health обязан отдавать provider, enabled и initialized —
+    иначе мониторинг не видит, что LLM-провайдер отключён.
+    """
     # Register and login to get auth cookie
     await client.post(
         "/auth/register",
@@ -61,7 +71,11 @@ async def test_chat_health(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_chat_evaluate(client: AsyncClient):
-    """POST /chat/evaluate -> 200 with evaluation score."""
+    """Ловит сбой оценки: ответ не получает числовую оценку.
+
+    /chat/evaluate обязан вернуть score (число) — клиент использует
+    его для проверки качества ответов ассистента.
+    """
     # Register and login to get auth cookie
     await client.post(
         "/auth/register",

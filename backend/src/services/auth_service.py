@@ -1,6 +1,11 @@
 """
-Authentication Service
-Registration, login, JWT handling
+Сервис аутентификации пользователей: регистрация, логин, JWT.
+
+Реализует 152-ФЗ-совместимую модель доступа: телефон хранится только как
+HMAC-SHA256-хеш (псевдонимизация), пароль — bcrypt, JWT — короткоживущий
+с версионированием (jwt_version) для мгновенной инвалидации всех токенов.
+
+Логика согласована с `AuthService`, `dependencies.get_current_admin` и моделью User.
 """
 
 import hashlib
@@ -20,24 +25,32 @@ settings = get_settings()
 
 
 class AuthService:
-    """Service for user authentication."""
+    """
+    Сервис аутентификации: регистрация, логин, проверка JWT.
+
+    Жизненный цикл: создаётся на каждый запрос с сессией БД (AsyncSession),
+    не хранит состояния между вызовами.
+
+    Ключевые решения:
+    - телефон хешируется HMAC-SHA256 (не bcrypt): bcrypt рассчитан на
+      низкоэнтропийные пароли и уязвим к rainbow-таблицам для телефонов;
+    - JWT содержит версию (ver): инкремент jwt_version при логине мгновенно
+      инвалидирует все выпущенные ранее токены (I.1.2).
+    """
 
     def __init__(self, db: AsyncSession):
         self.db = db
 
     async def register(self, phone: str, password: str) -> User:
         """
-        Register new user.
-
+        Регистрация нового пользователя.
         Args:
-            phone: Phone number
-            password: Plain text password
-
+            phone: номер телефона
+            password: пароль в открытом виде (хешируется bcrypt, 12 раундов)
         Returns:
-            Created User instance
-
+            созданный User
         Raises:
-            ValueError: If user with this phone already exists
+            ValueError: если пользователь с таким телефоном уже существует
         """
         phone_hash = self._hash_phone(phone)
 
@@ -69,17 +82,14 @@ class AuthService:
 
     async def login(self, phone: str, password: str) -> str:
         """
-        Login user and return JWT token.
-
+        Логин: проверка пароля и выпуск JWT.
         Args:
-            phone: Phone number
-            password: Plain text password
-
+            phone: номер телефона
+            password: пароль в открытом виде
         Returns:
             JWT access token
-
         Raises:
-            ValueError: If credentials are invalid
+            ValueError: если учётные данные неверны
         """
         # Find user by phone hash
         phone_hash = self._hash_phone(phone)
@@ -108,16 +118,14 @@ class AuthService:
 
     async def get_current_user(self, token: str) -> User:
         """
-        Validate JWT and return user.
+        Проверка JWT и возврат пользователя.
 
+        Помимо подписи проверяет exp и версию (ver): расхождение с jwt_version
+        означает отзыв токена (I.1.2) — вызывается ValueError.
         Args:
             token: JWT access token
-
         Returns:
-            User instance
-
-        Raises:
-            ValueError: If token is invalid, revoked, or user not found
+            User
         """
         try:
             payload = jwt.decode(
@@ -157,11 +165,13 @@ class AuthService:
 
     def _hash_phone(self, phone: str) -> str:
         """
-        Hash phone number using SHA-256 with tenant-specific salt.
-
-        Uses HMAC-SHA256 instead of bcrypt because bcrypt is designed
-        for low-entropy passwords and is vulnerable to rainbow tables
-        for high-entropy data like phone numbers.
+        Хеширование телефона: HMAC-SHA256 с солью приложения.
+        Почему не bcrypt: он рассчитан на низкоэнтропийные пароли, для телефонов
+        уязвим к rainbow-таблицам. HMAC с солью SECRET_KEY даёт псевдонимизацию.
+        Args:
+            phone: номер телефона
+        Returns:
+            hex-строка SHA-256 хеша
         """
         salt = settings.SECRET_KEY.encode("utf-8")
         return hmac.new(
@@ -171,7 +181,16 @@ class AuthService:
         ).hexdigest()
 
     def _generate_token(self, user_id: uuid.UUID, version: int = 1) -> str:
-        """Generate JWT token for user with version for revocation support."""
+        """
+        Генерация JWT с версией для отзыва (revocation).
+        Полезная нагрузка: sub (user_id), ver (version), exp (JWT_EXPIRATION_HOURS),
+        iat. Секрет — effective_jwt_secret из настроек.
+        Args:
+            user_id: идентификатор пользователя
+            version: версия токена (jwt_version)
+        Returns:
+            JWT-строка
+        """
         payload = {
             "sub": str(user_id),
             "ver": version,

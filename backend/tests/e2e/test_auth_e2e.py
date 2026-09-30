@@ -1,6 +1,9 @@
 """
-E2E Tests for Authentication Flow
-Tests registration, login, token validation, and logout.
+E2E-тесты полного сценария аутентификации.
+
+Покрывают регистрацию (успех и дубликат), логин (верный/неверный
+пароль, httpOnly-cookie), GET /auth/me с сессией и без неё, а также
+логаут с последующей проверкой, что сессия действительно закрыта.
 """
 
 import pytest
@@ -9,7 +12,10 @@ from httpx import AsyncClient
 
 @pytest.mark.asyncio
 async def test_register_user_success(client: AsyncClient):
-    """POST /auth/register with valid data → 201 + response has id, phone_hash."""
+    """Ловит сбой регистрации: валидные данные не дают 201 и тела ответа.
+
+    Контракт /auth/register: 201 + id, phone_hash, created_at, is_active.
+    """
     response = await client.post(
         "/auth/register",
         json={
@@ -28,7 +34,11 @@ async def test_register_user_success(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_register_user_duplicate(client: AsyncClient):
-    """Register same phone twice → 400 error."""
+    """Ловит дубликаты аккаунтов: повторная регистрация не отклоняется.
+
+    Один номер телефона = один аккаунт; повторный запрос обязан
+    вернуть 400, иначе пользователь плодит лишние записи.
+    """
     payload = {
         "phone": "+79991234567",
         "password": "TestPassword123!",
@@ -42,7 +52,11 @@ async def test_register_user_duplicate(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_login_success(client: AsyncClient):
-    """Register then login → 200 + access_token cookie is set."""
+    """Ловит сбой логина: токен и cookie не выдаются после регистрации.
+
+    Проверяет 200, access_token в теле, token_type=bearer и наличие
+    cookie access_token — всё, что нужно SPA для авторизации.
+    """
     await client.post(
         "/auth/register",
         json={
@@ -67,7 +81,11 @@ async def test_login_success(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_login_wrong_password(client: AsyncClient):
-    """Register, then login with wrong password → 401."""
+    """Ловит дыру в логине: неверный пароль не отклоняется.
+
+    Чужие пароли не должны давать доступ; 401 обязателен,
+    иначе аутентификация бессмысленна.
+    """
     await client.post(
         "/auth/register",
         json={
@@ -88,7 +106,11 @@ async def test_login_wrong_password(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_me_with_valid_token(client: AsyncClient):
-    """Register, login, GET /auth/me with cookie → 200 + user data."""
+    """Ловит потерю сессии: /auth/me с cookie не отдаёт пользователя.
+
+    Сверяет id из /auth/me с id из регистрации — сессия должна
+    идентифицировать именно того пользователя, что залогинился.
+    """
     register_response = await client.post(
         "/auth/register",
         json={
@@ -119,14 +141,21 @@ async def test_me_with_valid_token(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_me_without_token(client: AsyncClient):
-    """GET /auth/me without cookie → 401."""
+    """Ловит дыру в авторизации: /auth/me доступен без cookie.
+
+    Личные данные (152-ФЗ) обязаны быть закрытыми — 401 без сессии.
+    """
     response = await client.get("/auth/me")
     assert response.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_logout(client: AsyncClient):
-    """Register, login, POST /auth/logout, then GET /auth/me → 401."""
+    """Ловит незакрытую сессию: после логаута токен продолжает работать.
+
+    POST /auth/logout обязан инвалидировать сессию: до логаута
+    /auth/me даёт 200, после — 401.
+    """
     await client.post(
         "/auth/register",
         json={

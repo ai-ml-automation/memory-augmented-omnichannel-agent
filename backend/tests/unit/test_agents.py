@@ -1,9 +1,15 @@
 """
 Unit Tests for Phase D.2 LangGraph Agents
 
-Covers: FactExtractorAgent, MemoryManagerAgent,
-        ResponseGeneratorAgent, ConflictResolverAgent.
-Pure-mock tests — no database or external services required.
+Покрывают: FactExtractorAgent, MemoryManagerAgent,
+ResponseGeneratorAgent, ConflictResolverAgent.
+Pure-mock тесты — база данных и внешние сервисы не нужны.
+
+Зачем эти тесты: агенты — умный слой поверх памяти. Тесты фиксируют
+контракт каждого агента: извлечение фактов через LLM с фильтрацией
+эмоций и анонимизацией PII, сохранение/поиск через MemoryService,
+генерацию ответа с контекстом памяти и graceful degradation при
+отключённом LLM, а также логику разрешения конфликтов фактов.
 """
 
 import json
@@ -24,13 +30,23 @@ _PATCH_FE_ANON = "backend.src.utils.presidio_anonymizer.anonymize_text"
 
 
 class TestFactExtractorAgent:
-    """Tests for FactExtractorAgent pipeline (D.2.2)."""
+    """Группа тестов FactExtractorAgent: извлечение фактов через LLM (D.2.2).
+
+    Покрывают вызов LLM с разбором JSON-ответа, фильтрацию эмоций,
+    анонимизацию PII через Presidio и graceful degradation при
+    выключенном LLM или невалидном JSON.
+    """
 
     @pytest.mark.asyncio
     @patch(_PATCH_FE_SETTINGS)
     @patch(_PATCH_FE_LLM)
     async def test_extract_calls_llm(self, mock_llm_cls, mock_settings):
-        """extract() calls LLM, parses JSON, and returns facts."""
+        """Ловит баг, если extract не вызывает LLM или не парсит ответ.
+
+        LLM.generate вызывается один раз, JSON-ответ разбирается в список
+        фактов, поля type/content сохраняются без искажений. Сломанный
+        парсинг здесь обесценит весь конвейер извлечения фактов.
+        """
         from backend.src.agents.fact_extractor import FactExtractorAgent
 
         mock_settings.ENABLE_LLM = True
@@ -56,7 +72,12 @@ class TestFactExtractorAgent:
     @patch(_PATCH_FE_SETTINGS)
     @patch(_PATCH_FE_LLM)
     async def test_extract_filters_emotions(self, mock_llm_cls, mock_settings):
-        """Facts with type='emotion' are filtered out."""
+        """Ловит баг, если эмоции попадают в хранимые факты.
+
+        Факт с type="emotion" обязан отфильтроваться: из трёх ответов LLM
+        остаются только preference и fact. Эмоции нестабильны во времени
+        и засоряют память клиента ложными сведениями.
+        """
         from backend.src.agents.fact_extractor import FactExtractorAgent
 
         mock_settings.ENABLE_LLM = True
@@ -86,7 +107,12 @@ class TestFactExtractorAgent:
     async def test_extract_anonymizes_pii(
         self, mock_llm_cls, mock_settings, mock_anon
     ):
-        """PII in fact content is anonymized via Presidio."""
+        """PII в содержании факта анонимизируется через Presidio.
+
+        Содержимое факта должно проходить через anonymize_text: имя "John"
+        заменяется на "[PERSON]", а флаг pii_masked выставляется в True.
+        Пропуск анонимизации сохранит персональные данные в открытом виде.
+        """
         from backend.src.agents.fact_extractor import FactExtractorAgent
 
         mock_settings.ENABLE_LLM = True
@@ -116,7 +142,12 @@ class TestFactExtractorAgent:
     async def test_extract_llm_disabled_returns_empty(
         self, mock_llm_cls, mock_settings
     ):
-        """When ENABLE_LLM=False, extraction returns empty list."""
+        """Ловит баг, если при ENABLE_LLM=False extract не пуст.
+
+        При выключенном LLM агент обязан вернуть пустой список, не трогая
+        LLM-сервис. Извлечение без провайдера упало бы на сетевом вызове
+        или вернуло бы мусор — пустой результат это штатное поведение.
+        """
         from backend.src.agents.fact_extractor import FactExtractorAgent
 
         mock_settings.ENABLE_LLM = False
@@ -133,7 +164,12 @@ class TestFactExtractorAgent:
     async def test_extract_invalid_json_returns_empty(
         self, mock_llm_cls, mock_settings
     ):
-        """Non-JSON LLM response produces empty list."""
+        """Ловит баг, если невалидный JSON от LLM роняет extract.
+
+        Когда generate возвращает не-JSON строку, агент обязан вернуть
+        пустой список, а не бросить исключение. Ошибка парсинга — частая
+        реальность LLM-ответов, её надо глотать, а не ронять конвейер.
+        """
         from backend.src.agents.fact_extractor import FactExtractorAgent
 
         mock_settings.ENABLE_LLM = True
@@ -156,11 +192,21 @@ class TestFactExtractorAgent:
 
 
 class TestMemoryManagerAgent:
-    """Tests for MemoryManagerAgent store/retrieve (D.2.3)."""
+    """Группа тестов MemoryManagerAgent: сохранение и поиск фактов (D.2.3).
+
+    Покрывают делегирование в MemoryService.store_fact со сбором
+    результатов, graceful handling при падении сервиса и поиск фактов
+    через search_facts с лимитом 10.
+    """
 
     @pytest.mark.asyncio
     async def test_store_facts_delegates_to_service(self):
-        """store_facts() delegates to MemoryService.store_fact."""
+        """Ловит баг, если store_facts не сохраняет факты в память.
+
+        Каждый факт обязан уйти в memory_service.store_fact, а результат —
+        содержать id (строкой) и status="stored". Потеря вызова здесь
+        означает, что извлечённый факт никогда не попадёт в память.
+        """
         from backend.src.agents.memory_manager import MemoryManagerAgent
 
         user_id = uuid.uuid4()
@@ -183,7 +229,12 @@ class TestMemoryManagerAgent:
 
     @pytest.mark.asyncio
     async def test_store_facts_handles_service_failure(self):
-        """When MemoryService raises, error is recorded gracefully."""
+        """Ловит баг, если падение MemoryService роняет store_facts.
+
+        При исключении из store_fact результат должен содержать "error",
+        а не пробрасывать исключение — агент обязан продолжить работу
+        с остальными фактами и вернуть отчёт о сбое наверх.
+        """
         from backend.src.agents.memory_manager import MemoryManagerAgent
 
         user_id = uuid.uuid4()
@@ -202,7 +253,13 @@ class TestMemoryManagerAgent:
 
     @pytest.mark.asyncio
     async def test_retrieve_facts_delegates_to_search(self):
-        """retrieve_facts delegates to MemoryService.search_facts."""
+        """Ловит баг, если retrieve_facts не пробрасывает запрос в поиск.
+
+        search_facts должен вызываться с (user_id, "coffee", 10) — лимит
+        в 10 фактов фиксирован агентом, а результат нормализуется
+        к dict с content и source="memory_service". Игнорирование лимита
+        или запроса исказит подборку фактов для генератора ответа.
+        """
         from backend.src.agents.memory_manager import MemoryManagerAgent
 
         user_id = uuid.uuid4()
@@ -235,7 +292,12 @@ _PATCH_RG_SETTINGS = "backend.src.agents.response_generator.settings"
 
 
 class TestResponseGeneratorAgent:
-    """Tests for ResponseGeneratorAgent (D.2.4)."""
+    """Группа тестов ResponseGeneratorAgent: генерация ответа с памятью (D.2.4).
+
+    Покрывают вызов LLM без контекста памяти (context_used=False),
+    встраивание контекста при его наличии (context_used=True)
+    и fallback-ответ при отключённом LLM.
+    """
 
     @pytest.mark.asyncio
     @patch(_PATCH_RG_SETTINGS)
@@ -244,7 +306,12 @@ class TestResponseGeneratorAgent:
     async def test_generate_calls_llm(
         self, mock_llm_cls, mock_mem_cls, mock_settings
     ):
-        """generate() calls LLM and returns response with context_used=False."""
+        """Ловит баг, если generate не возвращает ответ LLM.
+
+        При пустом контексте памяти generate обязан вызвать LLM и вернуть
+        response с context_used=False и fallback=False. Потеря флагов
+        сломает аналитику качества ответов на дашборде.
+        """
         from backend.src.agents.response_generator import ResponseGeneratorAgent
 
         mock_settings.ENABLE_LLM = True
@@ -273,7 +340,12 @@ class TestResponseGeneratorAgent:
     async def test_generate_with_memory_context(
         self, mock_llm_cls, mock_mem_cls, mock_settings
     ):
-        """When memory context exists, context_used is True."""
+        """Ловит баг, если контекст памяти не помечается использованным.
+
+        Когда get_memory_context возвращает непустую строку, generate
+        обязан выставить context_used=True — иначе не видно, какие ответы
+        ассистента опирались на память о клиенте.
+        """
         from backend.src.agents.response_generator import ResponseGeneratorAgent
 
         mock_settings.ENABLE_LLM = True
@@ -306,7 +378,12 @@ class TestResponseGeneratorAgent:
     async def test_generate_llm_disabled_returns_fallback(
         self, mock_llm_cls, mock_mem_cls, mock_settings
     ):
-        """When ENABLE_LLM=False, fallback response is returned."""
+        """Ловит баг, если при ENABLE_LLM=False нет fallback-ответа.
+
+        generate обязан вернуть FALLBACK_RESPONSE с fallback=True и
+        context_used=False, не вызывая LLM. Без фолбэка чат умрёт
+        при недоступности LLM-провайдера.
+        """
         from backend.src.agents.response_generator import (
             FALLBACK_RESPONSE,
             ResponseGeneratorAgent,
@@ -337,10 +414,20 @@ class TestResponseGeneratorAgent:
 
 
 class TestConflictResolverAgent:
-    """Tests for ConflictResolverAgent resolution logic (D.2.5)."""
+    """Группа тестов ConflictResolverAgent: логика разрешения конфликтов (D.2.5).
+
+    Покрывают приоритет более свежего факта (порог 5 минут), сохранение
+    старого при более новом существующем, эскалацию в HITL при быстром
+    конфликте и фолбэк на сравнение весов без временных меток.
+    """
 
     def test_resolve_later_overrides_earlier(self):
-        """New fact with timestamp > existing by >5 min → override."""
+        """Ловит баг, если новый факт не заменяет заметно более старый.
+
+        Когда новый факт новее существующего больше чем на 5 минут,
+        resolver обязан выбрать action="override" с новым содержанием
+        и requires_hitl=False — без человека, конфликт очевиден.
+        """
         from backend.src.agents.conflict_resolver import ConflictResolverAgent
 
         resolver = ConflictResolverAgent()
@@ -361,7 +448,12 @@ class TestConflictResolverAgent:
         assert result["requires_hitl"] is False
 
     def test_resolve_keep_existing_if_older(self):
-        """Existing fact is newer than new → keep existing."""
+        """Ловит баг, если старый факт перетирает более свежий.
+
+        Когда существующий факт новее нового, resolver обязан вернуть
+        action="keep_existing" с прежним содержанием. Перезапись свежего
+        факта старым потеряет актуальную информацию о клиенте.
+        """
         from backend.src.agents.conflict_resolver import ConflictResolverAgent
 
         resolver = ConflictResolverAgent()
@@ -382,7 +474,12 @@ class TestConflictResolverAgent:
         assert result["requires_hitl"] is False
 
     def test_resolve_hitl_for_rapid_conflict(self):
-        """Timestamps within 5 minutes → requires_hitl=True."""
+        """Ловит баг, если быстрый конфликт решается без человека.
+
+        Когда разница временных меток меньше 5 минут, resolver обязан
+        вернуть requires_hitl=True и action="flag_for_review" — противоречие
+        за короткий срок слишком рискованно для автоматической перезаписи.
+        """
         from backend.src.agents.conflict_resolver import ConflictResolverAgent
 
         resolver = ConflictResolverAgent()
@@ -402,7 +499,12 @@ class TestConflictResolverAgent:
         assert result["action"] == "flag_for_review"
 
     def test_resolve_by_weight_when_no_timestamps(self):
-        """No datetime strings → fall back to weight comparison."""
+        """Ловит баг, если конфликт без дат решается не по весам.
+
+        При отсутствии временных меток resolver обязан сравнить weight:
+        больший вес побеждает (action="override"). Пропуск фолбэка
+        приведёт к падению на данных без created_at.
+        """
         from backend.src.agents.conflict_resolver import ConflictResolverAgent
 
         resolver = ConflictResolverAgent()

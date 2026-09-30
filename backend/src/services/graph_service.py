@@ -1,6 +1,17 @@
 """
-Graph Service
-Integration with Neo4j for knowledge graph operations (async driver)
+Сервис работы с графом знаний Neo4j (асинхронный драйвер).
+
+Хранит факты пользователя как узлы и связи: это даёт ответы на вопросы
+«что связано с чем» быстрее, чем перебор в векторном поиске, и служит
+источником контекста для LLM (Phase C.1.1).
+
+Ключевые решения:
+- AsyncGraphDatabase не блокирует event loop FastAPI при конкурентных запросах;
+- ленивая инициализация драйвера — сервис стартует без Neo4j (ENABLE_LLM=false);
+- каждая операция проверяет consent (152-ФЗ, B.1.4) и валидирует типы связей
+  против RelationshipType (защита от Cypher Injection, I.1.1).
+
+@see RelationshipType, mem0_memory_service
 """
 
 import logging
@@ -16,17 +27,41 @@ settings = get_settings()
 
 class GraphService:
     """
-    Knowledge graph service using Neo4j.
+    Сервис графа знаний на базе Neo4j.
 
-    Manages relationships between facts and entities.
-    Uses AsyncGraphDatabase to avoid blocking the FastAPI event loop.
+    Ответственность: создание узлов фактов, связей между ними, чтение графа
+    пользователя и поиск связанных фактов для контекста памяти.
+
+    Жизненный цикл: один экземпляр на приложение; асинхронный драйвер
+    создаётся лениво при первой операции и используется повторно.
+
+    Почему Neo4j: связи фактов (SUPERSEDES, CONFLICTS_WITH) — это графовая
+    модель; обход по связям в Neo4j на порядки дешевле, чем в реляционной БД.
+    Асинхронный драйвер выбран, чтобы не блокировать event loop FastAPI.
+
+    @see RelationshipType (типы связей), VectorStoreService (векторный поиск)
     """
 
     def __init__(self):
+        """
+        Инициализация сервиса без подключения к Neo4j.
+
+        Драйвер создаётся лениво в _get_driver при первой операции —
+        это позволяет приложению стартовать без работающей базы графов.
+        """
         self._driver = None
 
     def _get_driver(self) -> Any:
-        """Lazy initialization of async Neo4j driver."""
+        """
+        Ленивая инициализация асинхронного драйвера Neo4j.
+
+        Почему лениво: пакет neo4j может быть не установлен, а сама Neo4j —
+        недоступна; сервис обязан стартовать (ENABLE_LLM=false) и сообщать
+        о недоступности графа только в момент реальной операции.
+
+        Raises:
+            RuntimeError: если граф отключён или пакет neo4j не установлен
+        """
         if self._driver is None:
             if not settings.ENABLE_LLM:
                 raise RuntimeError("Graph store disabled (ENABLE_LLM=false)")
@@ -54,21 +89,23 @@ class GraphService:
         consent_verified: bool = False,
     ) -> bool:
         """
-        Create a fact node in the graph.
+        Создание узла факта в графе знаний.
 
-        152-FZ: consent_verified must be True; otherwise operation is
-        logged as a compliance violation and skipped.
+        Перед записью проверяется consent (152-ФЗ, B.1.4): при
+        consent_verified=False операция логируется как нарушение комплаенса
+        и пропускается. Узел и связь HAS_FACT создаются через MERGE, поэтому
+        повторные вызовы идемпотентны и не плодят дубликаты.
 
         Args:
-            fact_id: Fact identifier
-            user_id: User identifier
-            category: Fact category
-            content_summary: Short content summary
-            metadata: Optional metadata
-            consent_verified: Caller must confirm consent was checked
+            fact_id: идентификатор факта (uuid)
+            user_id: идентификатор пользователя-владельца
+            category: категория факта
+            content_summary: краткое содержание факта (без ПДн — только сводка)
+            metadata: дополнительные свойства узла
+            consent_verified: подтверждение проверки согласия вызывающим кодом
 
         Returns:
-            True if created successfully
+            True, если узел создан (или граф отключён)
         """
         if not settings.ENABLE_LLM:
             logger.warning("Graph store disabled, skipping")
@@ -119,22 +156,24 @@ class GraphService:
         consent_verified: bool = False,
     ) -> bool:
         """
-        Create relationship between two nodes.
+        Создание связи между двумя узлами графа.
 
-        152-FZ: consent_verified must be True.
+        Тип связи обязан пройти RelationshipType.is_valid до подстановки
+        в Cypher (I.1.1): интерполяция в строку запроса делает произвольный
+        ввод вектором инъекции. consent (152-ФЗ, B.1.4) — как в create_fact_node.
 
         Args:
-            from_id: Source node ID
-            to_id: Target node ID
-            relationship_type: Relationship type (must be in RelationshipType enum)
-            properties: Optional properties
-            consent_verified: Caller must confirm consent was checked
+            from_id: идентификатор исходного узла
+            to_id: идентификатор целевого узла
+            relationship_type: тип связи из RelationshipType
+            properties: дополнительные свойства связи
+            consent_verified: подтверждение проверки согласия
 
         Returns:
-            True if created
+            True, если связь создана (или граф отключён)
 
         Raises:
-            ValueError: If relationship_type is not in the whitelist
+            ValueError: если relationship_type не входит в белый список
         """
         if not settings.ENABLE_LLM:
             return False
@@ -190,14 +229,19 @@ class GraphService:
         depth: int = 2,
     ) -> dict[str, Any]:
         """
-        Get user's fact graph.
+        Получение графа фактов пользователя для контекста памяти.
+
+        Обход начинается от узла User по связям HAS_FACT на depth уровней
+        (LIMIT 100 защищает от слишком широкого обхода). Результат отдаётся
+        в виде списков узлов и связей для рендеринга/агрегации на стороне
+        вызова (например, в memory_search_service).
 
         Args:
-            user_id: User identifier
-            depth: Traversal depth
+            user_id: идентификатор пользователя
+            depth: глубина обхода графа
 
         Returns:
-            Graph data with nodes and relationships
+            dict с ключами nodes и relationships
         """
         if not settings.ENABLE_LLM:
             return {"nodes": [], "relationships": []}
@@ -247,18 +291,23 @@ class GraphService:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """
-        Find facts related to a given fact.
+        Поиск фактов, связанных с заданным фактом.
+
+        Используется для расширения контекста памяти: по связям RELATED_TO,
+        CONFLICTS_WITH и т.п. находятся факты, релевантные запросу даже без
+        общих ключевых слов. relationship_type валидируется (I.1.1) до
+        подстановки в Cypher; без него ищутся все связи в глубину до 2.
 
         Args:
-            fact_id: Fact identifier
-            relationship_type: Optional relationship type filter (must be in RelationshipType enum)
-            limit: Maximum results
+            fact_id: идентификатор исходного факта
+            relationship_type: фильтр по типу связи (из RelationshipType)
+            limit: максимальное число результатов
 
         Returns:
-            Related facts
+            список dict с ключами id, category, summary
 
         Raises:
-            ValueError: If relationship_type is not in the whitelist
+            ValueError: если relationship_type не входит в белый список
         """
         if not settings.ENABLE_LLM:
             return []
@@ -306,13 +355,18 @@ class GraphService:
         fact_id: uuid.UUID,
     ) -> bool:
         """
-        Delete fact node and its relationships.
+        Удаление узла факта вместе со всеми его связями.
+
+        DETACH DELETE снимает связи до удаления узла — без этого Neo4j
+        блокирует удаление узла с инцидентными рёбрами. Вызывается каскадом
+        из right_to_be_forgotten_service (RTBF, 152-ФЗ) при удалении
+        персональных данных пользователя.
 
         Args:
-            fact_id: Fact identifier
+            fact_id: идентификатор факта
 
         Returns:
-            True if deleted
+            True, если узел удалён (или граф отключён)
         """
         if not settings.ENABLE_LLM:
             return False

@@ -1,6 +1,13 @@
 ﻿"""
-Application Configuration
-Pydantic Settings for reading environment variables
+Конфигурация приложения через pydantic-settings.
+
+Значения берутся из переменных окружения и .env; при отсутствии — дефолт.
+Типы приводятся автоматически (str/int/bool).
+
+Ключевые решения:
+- get_settings (lru_cache) — одно чтение настроек на процесс;
+- в production JWT/ключ шифрования читаются из Vault, иначе дефолт из env;
+- тесты переопределяют поля: Settings(APP_ENV="test") — изоляция без .env.
 """
 
 from functools import lru_cache
@@ -10,40 +17,49 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    """Application settings."""
+    """
+    Настройки приложения (pydantic-settings): чтение env + .env.
+
+    Создаётся один раз через get_settings (lru_cache); для тестов
+    инстанцируется напрямую с переопределением полей.
+
+    Поля сгруппированы по блокам (PostgreSQL, Redis, Qdrant, Neo4j,
+    безопасность, LLM, Vault); секреты приходят из env/Vault, не из кода.
+    """
 
     # PostgreSQL
-    POSTGRES_HOST: str = "localhost"
-    POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = "omnichannel"
-    POSTGRES_USER: str = "postgres"
-    POSTGRES_PASSWORD: str = "changeme"
+    POSTGRES_HOST: str = "localhost"  # хост БД
+    POSTGRES_PORT: int = 5432  # порт БД
+    POSTGRES_DB: str = "omnichannel"  # имя БД
+    POSTGRES_USER: str = "postgres"  # пользователь БД
+    POSTGRES_PASSWORD: str = "changeme"  # пароль БД (env в production)
 
     # Redis
-    REDIS_HOST: str = "localhost"
-    REDIS_PORT: int = 6379
-    REDIS_DB: int = 0
+    REDIS_HOST: str = "localhost"  # хост Redis (брокер Celery + кэш)
+    REDIS_PORT: int = 6379  # порт Redis
+    REDIS_DB: int = 0  # номер БД Redis
 
     # Qdrant
-    QDRANT_HOST: str = "localhost"
-    QDRANT_PORT: int = 6333
-    QDRANT_URL: str = "http://localhost:6333"
-    QDRANT_API_KEY: str = ""
+    QDRANT_HOST: str = "localhost"  # хост векторной БД
+    QDRANT_PORT: int = 6333  # порт Qdrant
+    QDRANT_URL: str = "http://localhost:6333"  # полный URL для клиента
+    QDRANT_API_KEY: str = ""  # ключ доступа (пусто = без аутентификации)
 
     # Neo4j
-    NEO4J_HOST: str = "localhost"
-    NEO4J_PORT: int = 7687
-    NEO4J_USER: str = "neo4j"
-    NEO4J_PASSWORD: str = "changeme"
-    NEO4J_URI: str = "bolt://localhost:7687"
+    NEO4J_HOST: str = "localhost"  # хост графовой БД
+    NEO4J_PORT: int = 7687  # порт bolt Neo4j
+    NEO4J_USER: str = "neo4j"  # пользователь Neo4j
+    NEO4J_PASSWORD: str = "changeme"  # пароль Neo4j (env в production)
+    NEO4J_URI: str = "bolt://localhost:7687"  # URI для драйвера
 
     # MinIO (S3-compatible)
-    MINIO_ENDPOINT: str = "localhost:9000"
-    MINIO_ACCESS_KEY: str = "changeme"
-    MINIO_SECRET_KEY: str = "changeme"
-    MINIO_BUCKET: str = "omnichannel"
+    MINIO_ENDPOINT: str = "localhost:9000"  # endpoint MinIO
+    MINIO_ACCESS_KEY: str = "changeme"  # access key MinIO
+    MINIO_SECRET_KEY: str = "changeme"  # secret key MinIO
+    MINIO_BUCKET: str = "omnichannel"  # имя bucket
 
     # Security
+    # Секреты подписи и шифрования; реальные значения — из env/Vault в production
     SECRET_KEY: str = "changeme-generate-with-openssl"
     JWT_SECRET: str = "changeme-generate-with-openssl"
     JWT_ALGORITHM: str = "HS256"
@@ -54,22 +70,22 @@ class Settings(BaseSettings):
     )
 
     # App
-    APP_HOST: str = "0.0.0.0"
-    APP_PORT: int = 8000
-    APP_ENV: str = "development"
-    APP_DEBUG: bool = True
-    LOG_LEVEL: str = "INFO"
+    APP_HOST: str = "0.0.0.0"  # адрес прослушивания
+    APP_PORT: int = 8000  # порт HTTP
+    APP_ENV: str = "development"  # development | production
+    APP_DEBUG: bool = True  # режим отладки (False в production)
+    LOG_LEVEL: str = "INFO"  # уровень логирования
 
     # Feature Flags (all disabled by default)
-    ENABLE_LLM: bool = False
-    ENABLE_VOICE: bool = False
-    ENABLE_ASR: bool = False
-    ENABLE_TTS: bool = False
-    ENABLE_MEMORY: bool = False
+    ENABLE_LLM: bool = False  # включить LLM-пайплайн
+    ENABLE_VOICE: bool = False  # включить голосовой сценарий
+    ENABLE_ASR: bool = False  # включить распознавание речи
+    ENABLE_TTS: bool = False  # включить синтез речи
+    ENABLE_MEMORY: bool = False  # включить долговременную память
 
     # Celery
-    CELERY_BROKER_URL: str = "redis://localhost:6379/1"
-    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
+    CELERY_BROKER_URL: str = "redis://localhost:6379/1"  # брокер задач (Redis)
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"  # хранилище результатов
 
     # Messenger Tokens
     MAX_BOT_TOKEN: str = Field(default="", description="MAX messenger bot token")
@@ -89,8 +105,8 @@ class Settings(BaseSettings):
     LLM_API_KEY: str = Field(default="", description="LLM API key")
 
     # ASR / TTS
-    WHISPER_MODEL: str = "large-v3"
-    SILERO_MODEL_PATH: str = ""
+    WHISPER_MODEL: str = "large-v3"  # модель распознавания Whisper
+    SILERO_MODEL_PATH: str = ""  # путь к модели Silero TTS
 
     # CTI (Naumen / Asterisk)
     CTI_API_URL: str = Field(default="", description="CTI API URL")
@@ -160,5 +176,14 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def get_settings() -> Settings:
+    """
+    Получение единственного экземпляра Settings (кэш процесса).
+
+    lru_cache гарантирует, что настройки читаются из окружения один раз,
+    что важно для согласованности значений и производительности.
+
+    Returns:
+        Settings: экземпляр с прочитанными настройками
+    """
     return Settings()
 

@@ -1,7 +1,12 @@
 """
-Voice Router
-API endpoints for voice processing (Phase C.3.3).
-Thin router — /process delegates to VoiceService.
+Голосовой роутер: API обработки голоса (Phase C.3.3).
+
+Точка входа голосового канала: транскрибация (ASR), синтез (TTS), полный
+конвейер ASR -> Memory -> LLM -> TTS, стриминг по WebSocket и health-check.
+Каждая операция гейтится своим флагом конфигурации (ENABLE_ASR / ENABLE_TTS /
+ENABLE_VOICE) — если фича выключена, отдаётся аккуратный ответ с success=False
+вместо 500. Тонкий роутер: обработка делегируется SpeechService и
+VoiceService, здесь только UploadFile-параметры и формат ответа.
 """
 
 import logging
@@ -22,13 +27,24 @@ router = APIRouter(prefix="/voice", tags=["voice"])
 
 
 class VoiceMessageRequest(BaseModel):
-    """Voice message request schema."""
+    """Запрос голосового сообщения: кто звонит и на каком языке.
+
+    caller_id — идентификатор абонента, по которому память привязывается
+    к конкретному пользователю в голосовом канале.
+    """
+
     caller_id: str
     language: str = "ru-RU"
 
 
 class VoiceMessageResponse(BaseModel):
-    """Voice message response schema."""
+    """Ответ голосового канала.
+
+    Успех отделён от данных: даже при ошибке конвейера возвращается
+    success=False + error вместо HTTP-500 — клиент (IVR/телефония) может
+    корректно обработать сбой и сказать абоненту понятный текст.
+    """
+
     success: bool
     text: str | None = None
     audio: bytes | None = None
@@ -37,7 +53,12 @@ class VoiceMessageResponse(BaseModel):
 
 
 class VoiceHealthCheck(BaseModel):
-    """Voice health check schema."""
+    """Состояние голосовых компонентов.
+
+    Отдельно ASR, TTS и общий конвейер: по этим флагам клиент (IVR/фронтенд)
+    понимает, какие операции доступны, и не предлагает недоступные.
+    """
+
     asr_enabled: bool
     tts_enabled: bool
     voice_enabled: bool
@@ -49,14 +70,21 @@ async def transcribe_audio(
     language: str = "ru-RU",
 ) -> VoiceMessageResponse:
     """
-    Transcribe audio to text.
+    Транскрибация аудио в текст (ASR).
+
+    Гейт ENABLE_ASR: если распознавание выключено, не тратим ресурсы
+    на обработку файла — сразу возвращаем success=False. При ошибке
+    распознавания — 500 с текстом ошибки (это уже сбой, а не флаг).
 
     Args:
-        audio: Audio file
-        language: Language code
+        audio: Аудиофайл для распознавания.
+        language: Код языка (по умолчанию ru-RU).
 
     Returns:
-        Transcription result
+        Распознанный текст + уверенность, либо ошибка.
+
+    Raises:
+        500: Сбой распознавания.
     """
     if not settings.ENABLE_ASR:
         return VoiceMessageResponse(
@@ -92,15 +120,21 @@ async def synthesize_text(
     speed: float = 1.0,
 ) -> dict[str, Any]:
     """
-    Synthesize text to speech.
+    Синтез речи из текста (TTS).
+
+    Гейт ENABLE_TTS аналогичен ASR: выключенный синтез не обрабатывается.
+    Параметры voice и speed дают голосовому каналу управлять тембром и темпом.
 
     Args:
-        text: Text to speak
-        voice: Voice name
-        speed: Speech speed
+        text: Текст для озвучивания.
+        voice: Имя голоса (по умолчанию alena).
+        speed: Скорость речи (1.0 — нормальная).
 
     Returns:
-        Audio result
+        Аудио + длительность, либо ошибка.
+
+    Raises:
+        500: Сбой синтеза.
     """
     if not settings.ENABLE_TTS:
         return {
@@ -135,8 +169,23 @@ async def process_voice_message(
     db: AsyncSession = Depends(get_db),
 ) -> VoiceMessageResponse:
     """
-    Process voice message: ASR -> Memory -> LLM -> TTS.
-    C.3.3: Delegates to VoiceService.
+    Полный голосовой конвейер: ASR -> Memory -> LLM -> TTS.
+
+    C.3.3: делегирует VoiceService — тот распознаёт речь, достаёт память
+    по caller_id, генерирует ответ и синтезирует его в аудио. Ленивый импорт
+    VoiceService держит роутер лёгким при старте. Гейт ENABLE_VOICE отключает
+    конвейер целиком.
+
+    Args:
+        audio: Аудиофайл абонента.
+        caller_id: Идентификатор абонента (для памяти).
+        db: Сессия БД.
+
+    Returns:
+        Текст + аудио-ответ + уверенность, либо ошибка.
+
+    Raises:
+        500: Сбой конвейера.
     """
     if not settings.ENABLE_VOICE:
         return VoiceMessageResponse(
@@ -169,8 +218,15 @@ async def process_voice_message(
 @router.websocket("/stream")
 async def voice_stream(websocket: Any) -> None:
     """
-    WebSocket endpoint for real-time voice streaming.
-    Phase D.3.4: Receives audio chunks, processes, returns audio response.
+    WebSocket-стрим для реального времени (Phase D.3.4).
+
+    Принимает чанки аудио от клиента, каждый чанк транскрибирует (WhisperASR),
+    отдаёт транскрипцию, формирует ответ и синтезирует его в аудио (SileroTTS).
+    Ошибки ASR/TTS отправляются как JSON-сообщения, а не рвут соединение, —
+    клиент продолжает стримить. Если конвейер выключен — закрываем сразу.
+
+    Args:
+        websocket: Активное WebSocket-соединение.
     """
 
     await websocket.accept()
@@ -236,10 +292,13 @@ async def voice_stream(websocket: Any) -> None:
 @router.get("/health", response_model=VoiceHealthCheck)
 async def voice_health_check() -> VoiceHealthCheck:
     """
-    Check voice service health.
+    Состояние голосового сервиса.
+
+    По флагам клиент (IVR/фронтенд) решает, какие кнопки показывать:
+    если TTS выключен, незачем предлагать озвучку.
 
     Returns:
-        Voice service status
+        Статус ASR, TTS и голосового конвейера.
     """
     return VoiceHealthCheck(
         asr_enabled=settings.ENABLE_ASR,

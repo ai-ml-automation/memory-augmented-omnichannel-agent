@@ -1,9 +1,11 @@
 """
-V.3: Voice Pipeline Integration Tests
-Tests for voice transcribe and synthesize endpoints.
+V.3: Интеграционные тесты голосового пайплайна.
 
-Requires ENABLE_VOICE=true and working TTS/STT services.
-Audio fixture: backend/tests/fixtures/audio/test.wav
+Проверяют эндпоинты транскрибации и синтеза через HTTP-клиент:
+transcribe принимает WAV и возвращает текст, synthesize отдаёт
+аудио; оба отклоняют пустой ввод. Требуют ENABLE_VOICE=true и
+работающие TTS/STT; аудио-фикстура — backend/tests/fixtures/audio/test.wav
+(при отсутствии генерируется generate_audio.py).
 """
 
 import os
@@ -20,7 +22,11 @@ AUDIO_PATH = AUDIO_DIR / "test.wav"
 
 
 def _ensure_audio_fixture() -> Path:
-    """Generate test.wav if missing."""
+    """Генерирует test.wav, если файла нет, и возвращает путь к нему.
+
+    Returns:
+        Path: путь к существующему WAV-фикстуре.
+    """
     if not AUDIO_PATH.exists():
         script = AUDIO_DIR / "generate_audio.py"
         subprocess.run(
@@ -33,10 +39,19 @@ def _ensure_audio_fixture() -> Path:
 
 @pytest.mark.skipif(not VOICE_ENABLED, reason="Voice disabled (ENABLE_VOICE not set)")
 class TestVoiceTranscribe:
+    """Группа тестов транскрибации: /voice/transcribe при включённом голосе.
+
+    Покрывают успешный путь (WAV → текст) и отклонение пустого
+    аудио. Активны только при ENABLE_VOICE=true (V.3).
+    """
 
     @pytest.mark.asyncio
     async def test_transcribe_returns_text(self, client: AsyncClient):
-        """Transcribe a short WAV -> text."""
+        """Ловит поломку ASR-пути: валидный WAV не превращается в текст.
+
+        Отправляем реальный WAV-файл с параметром ru-RU и ждём
+        success=True с непустым текстом (V.3).
+        """
         audio_path = _ensure_audio_fixture()
         audio_data = audio_path.read_bytes()
         response = await client.post(
@@ -52,7 +67,11 @@ class TestVoiceTranscribe:
 
     @pytest.mark.asyncio
     async def test_transcribe_rejects_empty_audio(self, client: AsyncClient):
-        """Empty audio file -> error."""
+        """Ловит обработку пустого аудио: сервис не должен молча падать.
+
+        Пустой файл обязан завершиться ошибкой 4xx/5xx, а не висеть
+        или возвращать успех с мусором.
+        """
         response = await client.post(
             "/voice/transcribe",
             files={"audio": ("empty.wav", b"", "audio/wav")},
@@ -63,10 +82,19 @@ class TestVoiceTranscribe:
 
 @pytest.mark.skipif(not VOICE_ENABLED, reason="Voice disabled (ENABLE_VOICE not set)")
 class TestVoiceSynthesize:
+    """Группа тестов синтеза: /voice/synthesize при включённом голосе.
+
+    Покрывают успешный путь (текст → аудио-байты) и отклонение
+    пустого текста. Активны только при ENABLE_VOICE=true (V.3).
+    """
 
     @pytest.mark.asyncio
     async def test_synthesize_returns_audio(self, client: AsyncClient):
-        """Text -> audio bytes."""
+        """Ловит поломку TTS-пути: текст не превращается в аудио-байты.
+
+        Синтез «Hello world» голосом alena обязан вернуть success=True
+        и непустой аудио-буфер (base64) заметной длины (V.3).
+        """
         response = await client.post(
             "/voice/synthesize",
             json={"text": "Hello world", "voice": "alena"},
@@ -79,7 +107,11 @@ class TestVoiceSynthesize:
 
     @pytest.mark.asyncio
     async def test_synthesize_rejects_empty_text(self, client: AsyncClient):
-        """Empty text -> error."""
+        """Ловит синтез пустого текста: должен быть отклонён валидацией.
+
+        Пустая строка не может быть озвучена — API обязан вернуть
+        400/422, а не пытаться синтезировать мусор.
+        """
         response = await client.post(
             "/voice/synthesize",
             json={"text": "", "voice": "alena"},

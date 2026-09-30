@@ -1,16 +1,12 @@
 """
-Presidio Anonymizer Utility
-PII detection and anonymization for 152-FZ compliance.
+Утилита анонимизации PII через Microsoft Presidio (152-ФЗ).
 
-Presidio masks personal data (names, addresses, passports, phones,
-SNILS, INN, OGRN) BEFORE saving to the database, as required by 152-FZ.
+Персональные данные (ФИО, телефоны, адреса, документы) маскируются ДО записи
+в БД — это требование 152-ФЗ о защите персональных данных при хранении.
 
-Uses custom Russian document recognizers (II.2) for passport, SNILS, INN, OGRN.
-
-Usage:
-    from backend.src.utils.presidio_anonymizer import anonymize_text
-    clean = anonymize_text("Меня зовут Иван Петров, паспорт 4515 123456")
-    # → "<PERSON> зовут <PERSON>, паспорт <PASSPORT_RU>"
+Использует кастомные русские распознаватели документов РФ (II.2): паспорт,
+СНИЛС, ИНН, ОГРН (см. presidio_russian). Поведение при сбое — fail-open:
+исходный текст возвращается без анонимизации, ошибка логируется для аудита.
 """
 
 import logging
@@ -24,7 +20,13 @@ _anonymizer: Any = None
 
 
 def _get_analyzer() -> Any:
-    """Lazy initialization of Presidio AnalyzerEngine with Russian recognizers."""
+    """
+    Ленивая инициализация AnalyzerEngine с русскими распознавателями.
+
+    Lazy, потому что Presidio тяжёлый: движок создаётся при первом использовании,
+    а не при импорте модуля. Если русский пакет недоступен — fallback на стандартный
+    AnalyzerEngine; если presidio-analyzer не установлен — RuntimeError с инструкцией.
+    """
     global _analyzer
     if _analyzer is None:
         try:
@@ -47,7 +49,12 @@ def _get_analyzer() -> Any:
 
 
 def _get_anonymizer() -> Any:
-    """Lazy initialization of Presidio AnonymizerEngine."""
+    """
+    Ленивая инициализация AnonymizerEngine.
+
+    Аналогично `_get_analyzer`: движок создаётся при первом обращении;
+    при отсутствии пакета — RuntimeError с инструкцией по установке.
+    """
     global _anonymizer
     if _anonymizer is None:
         try:
@@ -86,20 +93,14 @@ def anonymize_text(
     anonymize_action: str = "replace",
 ) -> str:
     """
-    Detect and anonymize PII in text using Microsoft Presidio.
-
+    Обнаружение и анонимизация PII: сущности → <ENTITY_TYPE>.
     Args:
-        text: Input text to anonymize
-        language: Language code (default: "ru" for Russian)
-        entity_types: List of entity types to detect (default: DEFAULT_ENTITY_TYPES)
-        anonymize_action: Anonymization action ("replace", "redact", "hash", "encrypt")
-
+        text: входной текст
+        language: код языка (default "en")
+        entity_types: типы сущностей (default DEFAULT_ENTITY_TYPES)
+        anonymize_action: действие ("replace", "redact", "hash", "encrypt")
     Returns:
-        Anonymized text with PII replaced by <ENTITY_TYPE> placeholders
-
-    Example:
-        >>> anonymize_text("Меня зовут Иван, телефон +79991234567")
-        '<PERSON> зовут <PERSON>, телефон <PHONE_NUMBER>'
+        текст с PII, заменённым на плейсхолдеры
     """
     if not text or not text.strip():
         return text
@@ -144,17 +145,14 @@ def detect_pii(
     entity_types: list[str] | None = None,
 ) -> list[dict]:
     """
-    Detect PII entities in text without anonymizing.
-
-    Useful for audit logging — records what PII was detected.
-
+    Обнаружение PII без анонимизации — для аудита: список сущностей с позициями.
+    При пустом тексте или ошибке анализа возвращается пустой список.
     Args:
-        text: Input text to analyze
-        language: Language code (default: "ru")
-        entity_types: Entity types to detect
-
+        text: входной текст
+        language: код языка (default "en")
+        entity_types: типы сущностей (default DEFAULT_ENTITY_TYPES)
     Returns:
-        List of dicts with entity_type, start, end, score
+        list[dict] с entity_type, start, end, score
     """
     if not text or not text.strip():
         return []

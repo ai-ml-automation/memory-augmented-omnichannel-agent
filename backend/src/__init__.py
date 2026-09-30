@@ -1,1 +1,3 @@
-"""Backend source package."""
+"""
+Пакет backend.src: ядро FastAPI-приложения (модели, схемы, сервисы, API).
+"""

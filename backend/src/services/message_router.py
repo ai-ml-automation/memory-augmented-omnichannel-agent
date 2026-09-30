@@ -1,6 +1,16 @@
 """
-Message Router
-Routes incoming messages to the appropriate handler based on channel type
+Роутер входящих сообщений: выбор обработчика по типу канала.
+
+Реестр обработчиков (dict channel_type → async handler) позволяет вебхукам
+MAX/TG/VK/VOICE делегировать сообщение нужному сценарию без ветвлений
+в каждом эндпоинте.
+
+Ключевые решения:
+- ключ канала нормализуется в верхний регистр — каналы и настройки передают
+  тип в разном регистре;
+- идентификация пользователя выполняется до вызова обработчика: обработчики
+  получают уже известный user_id;
+- сбой обработчика не роняет канал — возвращается безопасный текст ошибки.
 """
 
 import logging
@@ -15,15 +25,25 @@ settings = get_settings()
 
 class MessageRouter:
     """
-    Routes messages by channel type.
+    Маршрутизация сообщений по типу канала.
 
-    Orchestrates message flow:
-    1. Identify user by channel + external_id
-    2. Route to appropriate handler
-    3. Return response
+    Жизненный цикл: реестр наполняется при старте приложения (register_handler),
+    каждый входящий запрос проходит route_message.
+
+    Почему реестр вместо if/elif: добавление нового канала — это один вызов
+    register_handler, без правки роутера; обработчик изолирован и тестируем отдельно.
+
+    Поток: идентификация пользователя (ChannelBindingService) → вызов обработчика
+    с user_id → ответ каналу.
     """
 
     def __init__(self):
+        """
+        Пустой реестр обработчиков.
+
+        Наполняется регистрацией через register_handler; хранит только обработчики
+        с ключом в верхнем регистре (нормализация выполняется при регистрации).
+        """
         self._handlers: dict[str, Callable[..., Coroutine[Any, Any, str]]] = {}
 
     def register_handler(
@@ -32,11 +52,15 @@ class MessageRouter:
         handler: Callable[..., Coroutine[Any, Any, str]],
     ) -> None:
         """
-        Register a handler for channel type.
+        Регистрация асинхронного обработчика для типа канала.
+
+        Ключ приводится к верхнему регистру: вебхуки и конфигурация могут
+        передавать тип в разном регистре, а маршрутизация (route_message)
+        использует ту же нормализацию.
 
         Args:
-            channel_type: Channel type (MAX, TG, VK, VOICE)
-            handler: Async handler function
+            channel_type: тип канала (MAX, TG, VK, VOICE)
+            handler: корутина-обработчик, принимающая user_id и text
         """
         self._handlers[channel_type.upper()] = handler
         logger.info(f"Registered handler for channel: {channel_type}")
@@ -50,20 +74,23 @@ class MessageRouter:
         **kwargs: Any,
     ) -> str:
         """
-        Route message to appropriate handler.
+        Маршрутизация сообщения в зарегистрированный обработчик.
+
+        Сначала идентифицируется пользователь: без привязки канала возвращается
+        отказ (152-ФЗ — данные без регистрации не обрабатываются). Исключения
+        обработчика превращаются в безопасный текст — канал не падает.
 
         Args:
-            channel_type: Channel type
-            external_id: External ID
-            text: Message text
-            binding_service: Channel binding service
-            **kwargs: Additional context
+            channel_type: тип канала (ключ реестра)
+            external_id: идентификатор пользователя в канале
+            text: текст сообщения
+            binding_service: сервис поиска пользователя по привязке
+            **kwargs: доп. контекст, передаётся в обработчик
 
         Returns:
-            Response text
-
+            текст ответа
         Raises:
-            ValueError: If no handler for channel type
+            ValueError: если для типа канала не зарегистрирован обработчик
         """
         handler = self._handlers.get(channel_type.upper())
 
@@ -95,7 +122,15 @@ class MessageRouter:
             return "Произошла ошибка при обработке сообщения."
 
     def get_registered_channels(self) -> list[str]:
-        """Get list of registered channel types."""
+        """
+        Список зарегистрированных типов каналов.
+
+        Используется для диагностики и health-проверок: показывает, какие
+        каналы реально подключены (ключи в верхнем регистре).
+
+        Returns:
+            list[str]: типы каналов реестра
+        """
         return list(self._handlers.keys())
 
 

@@ -1,5 +1,9 @@
 """
-E2E Tests for Health Check Endpoint
+E2E-тесты health-эндпоинта приложения.
+
+Проверяют доступность /health и корневого "/" без аутентификации,
+а также формат ответа: status (healthy/degraded/unhealthy) и services
+(словарь состояния подсистем).
 """
 
 import pytest
@@ -10,7 +14,11 @@ from backend.src.main import app
 
 @pytest.mark.asyncio
 async def test_health_check_returns_200():
-    """Test that /health endpoint returns 200 OK."""
+    """Ловит недоступность health: /health не отвечает 200.
+
+    Если health-эндпоинт падает — мониторинг не может отличить
+    живое приложение от мёртвого.
+    """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -21,7 +29,11 @@ async def test_health_check_returns_200():
 
 @pytest.mark.asyncio
 async def test_health_check_returns_correct_format():
-    """Test that /health endpoint returns correct JSON format."""
+    """Ловит поломку контракта: /health без полей status и services.
+
+    UI и внешние проверки ждут именно эти ключи; их отсутствие
+    ломает интеграцию с мониторингом.
+    """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -36,7 +48,11 @@ async def test_health_check_returns_correct_format():
 
 @pytest.mark.asyncio
 async def test_health_check_status_is_string():
-    """Test that status field is a string."""
+    """Ловит невалидный статус: /health вне healthy/degraded/unhealthy.
+
+    Скрипты мониторинга сравнивают статус со строками; любое
+    другое значение ломает алертинг.
+    """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -50,7 +66,11 @@ async def test_health_check_status_is_string():
 
 @pytest.mark.asyncio
 async def test_health_check_services_is_dict():
-    """Test that services field is a dictionary."""
+    """Ловит сбой структуры: services не является словарём.
+
+    По ключам services (БД, Redis, вектор-стор) агрегируется
+    общий статус; не-словарь ломает разбор на клиенте.
+    """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -63,7 +83,11 @@ async def test_health_check_services_is_dict():
 
 @pytest.mark.asyncio
 async def test_root_endpoint_returns_200():
-    """Test that root endpoint returns 200 OK."""
+    """Ловит недоступность корня: "/" не отвечает 200.
+
+    Корневой эндпоинт — точка входа API; его падение блокирует
+    все запросы клиентов.
+    """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -74,7 +98,11 @@ async def test_root_endpoint_returns_200():
 
 @pytest.mark.asyncio
 async def test_root_endpoint_returns_message():
-    """Test that root endpoint returns message."""
+    """Ловит потерю приветствия: "/" без поля message.
+
+    Корень API обязан отдавать строку message (название сервиса);
+    её отсутствие ломает клиентов, ожидающих это поле.
+    """
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:

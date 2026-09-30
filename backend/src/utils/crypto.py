@@ -1,8 +1,16 @@
 """
-Crypto Utility
-AES-256-GCM encryption/decryption for PII data at rest.
+Утилита шифрования персональных данных (PII) в состоянии покоя.
 
-152-FZ compliance: encrypting personal data before DB storage.
+Использует AES-256-GCM: алгоритм обеспечивает и конфиденциальность,
+и аутентичность (tag), что исключает незаметную модификацию зашифрованных данных.
+
+Почему шифруем на уровне приложения, а не БД:
+- данные остаются защищёнными даже при утечке дампа PostgreSQL;
+- требование 152-ФЗ о защите персональных данных при хранении.
+
+Формат на выходе: base64(nonce(12) || ciphertext || tag(16)).
+Алгоритм и упаковка синхронизированы с `decrypt` и тестами `test_crypto.py` —
+изменение формата ломает чтение ранее сохранённых данных.
 """
 
 import base64
@@ -22,7 +30,16 @@ _NONCE_LENGTH = 12
 
 
 def _get_key() -> bytes:
-    """Derive a 32-byte AES key from effective encryption key."""
+    """
+    Получение 32-байтного ключа AES из эффективного ключа приложения.
+    Ключ берётся из настроек (`effective_encryption_key`), а не генерируется:
+    это позволяет расшифровать данные после перезапуска без хранения ключа в БД.
+
+    ВАЖНО (подводный камень): ключ короче 32 байт дополняется нулями, длиннее —
+    обрезается. Оба случая ослабляют стойкость: длина ключа — ровно 32 байта.
+    Returns:
+        bytes: ключ длины ровно `_KEY_LENGTH` (32) байта
+    """
     settings = get_settings()
     raw = settings.effective_encryption_key.encode("utf-8")
     # If key is shorter than 32 bytes, pad with null bytes; if longer, truncate
@@ -31,15 +48,14 @@ def _get_key() -> bytes:
 
 def encrypt(plaintext: str) -> str:
     """
-    Encrypt plaintext using AES-256-GCM.
+    Шифрование строки AES-256-GCM.
 
-    Returns base64-encoded string: nonce(12) + ciphertext + tag(16).
-
+    Новый случайный nonce на каждый вызов: повтор nonce с тем же ключом раскрывает
+    данные и позволяет подделать tag. Формат: base64(nonce||ciphertext||tag).
     Args:
-        plaintext: String to encrypt
-
+        plaintext: открытый текст (UTF-8)
     Returns:
-        Base64-encoded ciphertext
+        base64-строка, пригодная для хранения в БД
     """
     key = _get_key()
     nonce = os.urandom(_NONCE_LENGTH)
@@ -54,16 +70,14 @@ def encrypt(plaintext: str) -> str:
 
 def decrypt(ciphertext_b64: str) -> str:
     """
-    Decrypt AES-256-GCM ciphertext.
+    Расшифровка AES-256-GCM-строки в исходный текст.
 
+    Любая ошибка (неверный ключ, повреждённые данные) оборачивается в ValueError
+    с общим сообщением — причина не раскрывается вызывающему.
     Args:
-        ciphertext_b64: Base64-encoded ciphertext from encrypt()
-
+        ciphertext_b64: результат `encrypt`
     Returns:
-        Decrypted plaintext string
-
-    Raises:
-        ValueError: If decryption fails (wrong key, corrupted data)
+        расшифрованный текст (UTF-8)
     """
     try:
         key = _get_key()
@@ -85,16 +99,13 @@ def decrypt(ciphertext_b64: str) -> str:
 
 def is_encrypted(value: str) -> bool:
     """
-    Quick heuristic to check if a value is likely encrypted.
-
-    Encrypted values are base64 strings with minimum length
-    (nonce 12 + tag 16 + at least 1 byte ciphertext = 29 bytes → 40 chars base64).
-
+    Эвристика: похоже ли значение на зашифрованное.
+    Зашифрованные значения — base64 от nonce(12)+ciphertext+tag(16): минимум
+    29 байт → 40 символов. Эвристика, а не гарантия: полную проверку делает `decrypt`.
     Args:
-        value: String to check
-
+        value: проверяемая строка
     Returns:
-        True if value looks like encrypted data
+        True при длине ≥ 40 и корректном base64
     """
     if len(value) < 40:
         return False

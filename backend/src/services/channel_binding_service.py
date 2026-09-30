@@ -1,6 +1,9 @@
 """
-Channel Binding Service
-Lookup and management of channel bindings for user identification
+Сервис привязки каналов для идентификации пользователя.
+
+Связывает внешний ID в канале (MAX, TG, VK, VOICE) с внутренним user_id:
+входящее сообщение из канала однозначно отображается на пользователя.
+Привязка мягкая — is_active=False, запись сохраняется для истории.
 """
 
 import uuid
@@ -12,7 +15,12 @@ from backend.src.models import ChannelBinding, User
 
 
 class ChannelBindingService:
-    """Service for channel binding lookups and user identification."""
+    """
+    Сервис привязок: поиск пользователя по каналу, связывание/отвязка.
+
+    Поиск идёт только по активным привязкам (is_active=True): отвязанный
+    канал не должен идентифицировать пользователя (152-ФЗ, отзыв согласия).
+    """
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -23,14 +31,15 @@ class ChannelBindingService:
         external_id: str,
     ) -> User | None:
         """
-        Find user by channel type and external ID.
+        Поиск пользователя по каналу и внешнему ID.
 
+        JOIN с ChannelBinding и фильтр is_active: учитываются только привязки,
+        по которым канал реально идентифицирует пользователя.
         Args:
-            channel_type: Channel type (MAX, TG, VK, VOICE)
-            external_id: External ID in the channel
-
+            channel_type: канал (MAX, TG, VK, VOICE)
+            external_id: внешний ID в канале
         Returns:
-            User if bound, None otherwise
+            User или None
         """
         result = await self.db.execute(
             select(User)
@@ -45,13 +54,14 @@ class ChannelBindingService:
 
     async def get_user_channels(self, user_id: uuid.UUID) -> list[ChannelBinding]:
         """
-        Get all active channels for user.
+        Активные каналы пользователя.
 
+        Отвязанные каналы не возвращаются: они не должны использоваться
+        для идентификации после отзыва согласия (152-ФЗ).
         Args:
-            user_id: User identifier
-
+            user_id: идентификатор пользователя
         Returns:
-            List of active ChannelBinding instances
+            список активных ChannelBinding
         """
         result = await self.db.execute(
             select(ChannelBinding).where(
@@ -68,15 +78,16 @@ class ChannelBindingService:
         external_id: str,
     ) -> ChannelBinding:
         """
-        Bind a channel to user.
+        Привязка канала к пользователю (идемпотентно).
 
+        Существующая привязка: возвращается как есть (свой пользователь)
+        или переключается на нового — канал принадлежит одному пользователю.
         Args:
-            user_id: User identifier
-            channel_type: Channel type
-            external_id: External ID
-
+            user_id: идентификатор пользователя
+            channel_type: канал (MAX, TG, VK, VOICE)
+            external_id: внешний ID в канале
         Returns:
-            Created or updated ChannelBinding
+            созданная или обновлённая ChannelBinding
         """
         # Check if binding already exists
         result = await self.db.execute(
@@ -114,14 +125,15 @@ class ChannelBindingService:
         external_id: str,
     ) -> bool:
         """
-        Unbind a channel.
+        Отвязка канала: is_active=False (запись сохраняется).
 
+        Мягкое удаление вместо физического: сохраняет аудит-след и позволяет
+        повторно привязать канал без потери истории (B.3.2).
         Args:
-            channel_type: Channel type
-            external_id: External ID
-
+            channel_type: канал (MAX, TG, VK, VOICE)
+            external_id: внешний ID в канале
         Returns:
-            True if unbound, False if not found
+            True если отвязан, False если привязка не найдена
         """
         result = await self.db.execute(
             select(ChannelBinding).where(

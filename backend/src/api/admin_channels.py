@@ -1,6 +1,12 @@
 """
-Channels Router
-Admin API for channel binding management (requires admin role)
+Административный роутер управления привязками каналов.
+
+Доступ — только для роли admin (@see get_current_admin). Позволяет видеть
+все привязки, привязывать канал к пользователю и отвязывать его.
+
+Почему административные эндпоинты, а не пользовательские: привязка канала
+к конкретному человеку — чувствительная операция (идентификация клиента),
+её должен выполнять оператор, а не сам клиент.
 """
 
 import logging
@@ -22,7 +28,13 @@ router = APIRouter(prefix="/admin/channels", tags=["admin-channels"])
 
 
 class ChannelBindingResponse(BaseModel):
-    """Channel binding response schema."""
+    """
+    Представление привязки канала для админ-панели.
+
+    Внешний идентификатор (`external_id`) — идентификатор клиента в канале
+    (например, Telegram user id); флаг `is_active` отражает мягкую привязку
+    (см. `ChannelBindingService`).
+    """
     id: uuid.UUID
     user_id: uuid.UUID
     channel_type: str
@@ -31,7 +43,12 @@ class ChannelBindingResponse(BaseModel):
 
 
 class ChannelBindRequest(BaseModel):
-    """Channel bind request schema."""
+    """
+    Запрос на создание привязки канала к пользователю.
+
+    Валидация существования пользователя выполняется в эндпоинте
+    `bind_channel` — схема отвечает только за формат запроса.
+    """
     user_id: uuid.UUID
     channel_type: str
     external_id: str
@@ -45,14 +62,17 @@ async def list_bindings(
     db: AsyncSession = Depends(get_db),
 ) -> list[ChannelBindingResponse]:
     """
-    List all channel bindings.
+    Список всех привязок каналов (постранично).
+
+    Используется для аудита: оператор видит, какие каналы привязаны к каким
+    пользователям, что помогает выявить некорректные привязки.
 
     Args:
-        skip: Offset
-        limit: Maximum number of bindings
+        skip: смещение от начала выборки
+        limit: максимальное число записей на страницу
 
     Returns:
-        List of bindings
+        list[ChannelBindingResponse]: привязки с внешними идентификаторами
     """
     result = await db.execute(
         select(ChannelBinding).offset(skip).limit(limit)
@@ -78,13 +98,16 @@ async def get_user_channels(
     db: AsyncSession = Depends(get_db),
 ) -> list[ChannelBindingResponse]:
     """
-    Get all channels for user.
+    Все привязки каналов конкретного пользователя.
+
+    Показывает каналы, через которые клиент общается с системой, —
+    базис для решения «по каким каналам продолжить диалог» (омниканальность).
 
     Args:
-        user_id: User identifier
+        user_id: UUID пользователя
 
     Returns:
-        List of bindings
+        list[ChannelBindingResponse]: активные и неактивные привязки
     """
     service = ChannelBindingService(db)
     bindings = await service.get_user_channels(user_id)
@@ -108,16 +131,21 @@ async def bind_channel(
     db: AsyncSession = Depends(get_db),
 ) -> ChannelBindingResponse:
     """
-    Bind a channel to user.
+    Привязка канала к пользователю.
+
+    Сначала проверяется существование пользователя — привязка канала к
+    несуществующему аккаунту создала бы «сиротскую» запись, на которую
+    невозможно идентифицировать клиента. Сервис `ChannelBindingService`
+    выполняет мягкую привязку (is_active).
 
     Args:
-        data: Bind request
+        data: user_id, channel_type, external_id
 
     Returns:
-        Created binding
+        ChannelBindingResponse: созданная привязка
 
     Raises:
-        404: User not found
+        HTTPException: 404, если пользователь не найден
     """
     # Check user exists
     result = await db.execute(
@@ -151,16 +179,20 @@ async def unbind_channel(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """
-    Unbind a channel.
+    Отвязка канала от пользователя.
+
+    Удаление привязки означает, что входящие сообщения этого канала больше
+    не будут связываться с данным пользователем — деактивация выполняется
+    в `ChannelBindingService.unbind_channel` (мягкое удаление).
 
     Args:
-        binding_id: Binding identifier
+        binding_id: UUID привязки
 
     Returns:
-        Success message
+        {"status": "unbound"}
 
     Raises:
-        404: Binding not found
+        HTTPException: 404, если привязка не найдена
     """
     result = await db.execute(
         select(ChannelBinding).where(ChannelBinding.id == binding_id)

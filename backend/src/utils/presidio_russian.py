@@ -1,7 +1,10 @@
 """
-Presidio Russian Recognizers
-Custom PII recognizers for Russian documents (152-FZ).
-Detects: PASSPORT_RU, SNILS, INN, OGRN
+Русские распознаватели PII для Presidio (152-ФЗ).
+
+Кастомные PatternRecognizer для документов РФ, которых нет в базовых preset:
+паспорт РФ, СНИЛС, ИНН, ОГРН. Каждый паттерн — регулярное выражение с порогом
+уверенности (score): компактные формы без разделителей получают меньший score,
+т.к. чаще дают ложные срабатывания.
 """
 
 import logging
@@ -12,6 +15,13 @@ _russian_analyzer = None
 
 
 def create_russian_analyzer():
+    """
+    Создание AnalyzerEngine с кастомными распознавателями документов РФ.
+
+    Загружает предустановленные распознаватели и добавляет паспорт РФ, СНИЛС,
+    ИНН, ОГРН. Score паттерна — уверенность распознавания: компактные формы
+    (без разделителей) намеренно получают низкий score из-за частых ложных срабатываний.
+    """
     try:
         from presidio_analyzer import (
             AnalyzerEngine,
@@ -79,6 +89,11 @@ def create_russian_analyzer():
 
 
 def get_russian_analyzer():
+    """
+    Ленивый синглтон движка: создаётся один раз и переиспользуется.
+
+    Lazy, чтобы не инициализировать тяжёлый AnalyzerEngine при импорте модуля.
+    """
     global _russian_analyzer
     if _russian_analyzer is None:
         _russian_analyzer = create_russian_analyzer()

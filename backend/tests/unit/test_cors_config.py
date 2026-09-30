@@ -1,7 +1,9 @@
 """
-Tests for CORS Configuration (Phase B.2.4)
+Юнит-тесты CORS-конфигурации (фаза B.2.4).
 
-B.2.4: CORS restrictive in production, open in development
+Структурные проверки main.py: в production CORS использует список
+CORS_ORIGINS из конфига, в development — fallback на "*", а методы заданы
+явным списком, а не wildcard (безопасность против неявного разрешения).
 """
 
 import sys
@@ -31,10 +33,18 @@ for _sub in [
 
 
 class TestCORSConfiguration:
-    """Tests for CORS middleware configuration in main.py."""
+    """
+    Структурные проверки CORS-настройки в main.py.
+
+    Ловит баги: CORS без учёта APP_ENV (один режим для всех окружений),
+    отсутствие fallback на "*" в dev и wildcard-методы вместо явного списка.
+    """
 
     def test_production_uses_configured_origins(self):
-        """In production, CORS should use configured origins from CORS_ORIGINS."""
+        """
+        В production origins берутся из конфига (cors_origins_list).
+        Ловит баг открытого CORS в проде — источник для любых origin.
+        """
         import inspect
         from backend.src import main
 
@@ -46,7 +56,10 @@ class TestCORSConfiguration:
         assert "cors_origins_list" in source
 
     def test_development_allows_all(self):
-        """In development, CORS should allow all origins."""
+        """
+        В development есть fallback на "*" (все origins разрешены).
+        Ловит баг пустого списка origins в dev — фронтенд не достучится.
+        """
         import inspect
         from backend.src import main
 
@@ -56,7 +69,10 @@ class TestCORSConfiguration:
         assert '"*"' in source or "'*'" in source
 
     def test_methods_are_explicit(self):
-        """CORS should use explicit method list, not wildcard."""
+        """
+        allow_methods задан явным списком (GET и т.п.), не "*".
+        Ловит баг wildcard-методов — лишние методы вроде DELETE открыты.
+        """
         import inspect
         from backend.src import main
 

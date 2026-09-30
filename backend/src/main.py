@@ -1,20 +1,11 @@
 ﻿"""
-FastAPI Application Entry Point
-Main application with router registration and health checks
+Точка входа FastAPI-приложения омниканального агента.
 
-Security (Phase B.2.4):
-- CORS: restrictive in production (reads APP_ENV + CORS_ORIGINS)
+Собирает приложение: lifespan (старт/стоп), CORS (ограничительный в
+production — B.2.4), JWT-middleware, OpenTelemetry-трейсинг (F.2.2),
+Prometheus-метрики (F.1.1) и все роутеры API.
 
-Monitoring (Phase F.1):
-- Prometheus metrics via prometheus-fastapi-instrumentator
-- Custom business metrics (LLM latency, Qdrant search, facts, conflicts)
-
-Logging (Phase F.2.1):
-- Structured JSON logs via python-json-logger
-- Context fields: user_id, session_id, trace_id
-
-Tracing (Phase F.2.2):
-- OpenTelemetry distributed tracing with Jaeger export
+Логирование — структурированный JSON (F.2.1) с полями user_id/session_id.
 """
 
 import asyncio
@@ -56,7 +47,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan manager."""
+    """Управление жизненным циклом приложения (старт/остановка).
+
+    На старте настраивает трейсинг и (если включён LLM) фоново предзагружает
+    Cross-Encoder, не блокируя запуск; на остановке логирует завершение.
+    """
     # Startup
     setup_tracing()
     logger.info("Application starting", extra={"env": settings.APP_ENV})
@@ -140,5 +135,9 @@ instrumentator.instrument(app).expose(app)
 
 @app.get("/")
 async def root() -> dict[str, str]:
-    """Root endpoint."""
+    """Корневой эндпоинт — приветствие сервиса.
+
+    Используется для быстрой проверки, что приложение поднято, без
+    обращения к зависимостям (в отличие от /health).
+    """
     return {"message": "Memory-Augmented Omnichannel Agent"}

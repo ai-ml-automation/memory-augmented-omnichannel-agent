@@ -1,6 +1,13 @@
 """
-FastAPI Dependencies
-Shared dependencies for route handlers
+Общие FastAPI-зависимости (dependencies) для обработчиков роутеров.
+
+Вынесены в отдельный модуль, чтобы логика аутентификации и авторизации
+не дублировалась в каждом роутере: роутеры лишь указывают
+`Depends(get_current_admin)`.
+
+Здесь реализована проверка admin-роли поверх JWT-аутентификации
+(`AuthService.get_current_user`); базовую проверку формата токена
+выполняет middleware `backend.src.middleware.JWTMiddleware`.
 """
 
 from fastapi import Depends, HTTPException, Request
@@ -16,19 +23,14 @@ async def get_current_admin(
     db: AsyncSession = Depends(get_db),
 ) -> User:
     """
-    Dependency that validates JWT and checks for admin role.
-
-    Used by admin-only endpoints to enforce role-based access control.
+    Dependency admin-эндпоинтов: JWT + роль (токен из HttpOnly-cookie,
+    единая точка проверки; 401/403).
 
     Args:
-        request: HTTP request with access_token cookie
-        db: Database session
-
+        request: HTTP-запрос с cookie access_token
+        db: сессия БД (из `get_db`)
     Returns:
-        Authenticated User with admin role
-
-    Raises:
-        HTTPException: 401 if not authenticated, 403 if not admin
+        User: аутентифицированный пользователь с ролью admin
     """
     token = request.cookies.get("access_token")
     if not token:

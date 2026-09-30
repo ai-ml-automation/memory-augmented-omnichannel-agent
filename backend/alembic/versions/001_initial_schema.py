@@ -1,9 +1,10 @@
-"""initial_schema
+"""Начальная схема БД: все 6 таблиц ядра приложения.
 
-Revision ID: 001_initial
-Revises: 
-Create Date: 2026-07-15
+Создаёт users, consents (152-ФЗ), channel_bindings, sessions, facts (память),
+audit_logs (журнал 152-ФЗ). Поля фактов хранятся в открытом виде, т.к. шифрование
+реализовано на уровне приложения (AES-256-GCM), а не в схеме.
 
+Revision ID: 001_initial | Revises: (первая миграция) | Create Date: 2026-07-15
 """
 from typing import Sequence, Union
 
@@ -20,6 +21,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    """
+    Создание таблиц начальной схемы в порядке зависимостей.
+
+    Порядок важен: consents/channel_bindings/sessions/facts ссылаются на users,
+    audit_logs — на users и facts, поэтому родительские таблицы создаются первыми.
+    """
     # Users table
     op.create_table(
         'users',
@@ -94,6 +101,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """
+    Удаление всех таблиц в обратном порядке (сначала зависимые).
+
+    Обратный порядок обязателен из-за внешних ключей: audit_logs → facts → users.
+    """
     op.drop_table('audit_logs')
     op.drop_table('facts')
     op.drop_table('sessions')

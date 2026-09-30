@@ -1,6 +1,14 @@
 """
-MAX Gateway
-Integration with MAX messenger via aiomax SDK
+Шлюз MAX (интеграция через aiomax SDK).
+
+Назначение: единая точка общения с мессенджером MAX — отправка
+исходящих сообщений и нормализация входящих вебхуков.
+Почему отдельный шлюз, а не общий: у каждого мессенджера своя модель
+идентификации отправителя и своя структура вебхука; шлюз прячет эти
+отличия за единым контрактом. MAX близок к Telegram по формату
+(sender в message), но схема payload своя.
+Почему гейт ENABLE_LLM: флаг используется как общий выключатель
+внешних интеграций — при его отключении клиент не создаётся.
 """
 
 import logging
@@ -13,14 +21,25 @@ settings = get_settings()
 
 
 class MAXGateway:
-    """Gateway for MAX messenger integration."""
+    """
+    Шлюз MAX (aiomax SDK).
+
+    Клиент Bot создаётся лениво — при первом использовании; токен
+    берётся из настроек. Ошибки отправки не пробрасываются наверх:
+    шлюз возвращает False, чтобы диалоговый конвейер продолжал работу.
+    """
 
     def __init__(self):
         self._client = None
         self._bot_token = settings.MAX_BOT_TOKEN
 
     def _get_client(self) -> Any:
-        """Lazy initialization of MAX client."""
+        """Ленивая инициализация MAX-клиента.
+
+        Почему лениво: aiomax — опциональная зависимость, импортируется
+        только при первой отправке. Отсутствующий пакет превращается
+        в RuntimeError с понятным текстом.
+        """
         if self._client is None:
             if not settings.ENABLE_LLM:
                 raise RuntimeError("MAX integration disabled (ENABLE_LLM=false)")
@@ -42,15 +61,19 @@ class MAXGateway:
         **kwargs: Any,
     ) -> bool:
         """
-        Send message to MAX user.
+        Отправить сообщение пользователю MAX.
+
+        Почему принимает именно внешний идентификатор: MAX-диалог ведётся
+        по внешнему id отправителя (chat_id), а не по внутреннему user_id
+        системы — маппинг делает channel_binding_service.
 
         Args:
-            user_external_id: User's external ID in MAX
-            text: Message text
-            **kwargs: Additional parameters
+            user_external_id: Внешний идентификатор пользователя в MAX.
+            text: Текст сообщения.
+            **kwargs: Дополнительные параметры.
 
         Returns:
-            True if sent successfully
+            True при успешной отправке.
         """
         if not settings.ENABLE_LLM:
             logger.warning("MAX integration disabled, skipping send")
@@ -71,13 +94,18 @@ class MAXGateway:
 
     async def get_webhook_data(self, data: dict[str, Any]) -> dict[str, Any]:
         """
-        Parse incoming webhook data from MAX.
+        Разобрать входящий вебхук MAX.
+
+        Почему отправитель берётся из message.sender: в отличие от
+        Telegram, где from на уровне message, в MAX отправитель вложен
+        в объект sender — нормализация прячет это от обработчика.
 
         Args:
-            data: Raw webhook data
+            data: Сырой вебхук MAX.
 
         Returns:
-            Parsed message data
+            Нормализованная схема {channel, external_id, text,
+            message_id, timestamp} — единый контракт для message_handler.
         """
         return {
             "channel": "MAX",

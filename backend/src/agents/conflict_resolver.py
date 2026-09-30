@@ -1,9 +1,17 @@
 """
-Conflict Resolver Agent
-Resolves conflicts between fact versions (Phase D.2.5).
+Агент разрешения конфликтов фактов (этап D.2.5).
 
-Rule: later overrides earlier
-HITL: for conflicts within 5 minutes
+Назначение: когда приходит факт, противоречащий сохранённому, решить,
+что сохранить. Почему «поздний перекрывает ранний»: для большинства
+фактов о пользователе (предпочтения, контакты) актуально последнее
+значение — старые данные устаревают.
+Почему окно HITL в 5 минут: если противоречие пришло почти сразу,
+это похоже на ошибку ввода или дубль — автоматическое перезаписывание
+опасно, нужен человек в цикле (flag_for_review).
+Почему метрики: число конфликтов по типу решения (override/keep/hitl)
+показывает, насколько агрессивно перезаписывается память.
+
+Правило: later overrides earlier. HITL: конфликты в пределах 5 минут.
 """
 
 import logging
@@ -20,8 +28,11 @@ HITL_THRESHOLD_MINUTES = 5
 
 class ConflictResolverAgent:
     """
-    Agent for resolving fact conflicts.
-    Phase D.2.5: Later-overrides-earlier rule, HITL for rapid conflicts.
+    Агент разрешения конфликтов фактов (D.2.5).
+
+    Правило «поздний перекрывает ранний»; при быстрых противоречиях
+    (окно HITL) — пометка на ручную проверку вместо автоматической
+    перезаписи, чтобы не потерять данные из-за ошибочного ввода.
     """
 
     def __init__(self) -> None:
@@ -33,18 +44,21 @@ class ConflictResolverAgent:
         new_fact: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Resolve conflict between existing and new fact.
+        Разрешить конфликт между сохранённым и новым фактом.
 
-        Rules:
-        1. If timestamps differ by >5 min: later overrides earlier
-        2. If timestamps differ by <=5 min: requires HITL (flag for review)
+        Правила:
+        1. Разница во времени > 5 минут: поздний перекрывает ранний.
+        2. Разница <= 5 минут: пометка на HITL (flag_for_review).
+        3. Время недоступно: решение по весу (новый с большим весом
+           перекрывает) — время важнее веса, но вес — честный фолбэк.
 
         Args:
-            existing_fact: Current fact with 'created_at', 'content', 'weight'
-            new_fact: New fact with 'created_at', 'content', 'weight'
+            existing_fact: Текущий факт {created_at, content, weight}.
+            new_fact: Новый факт {created_at, content, weight}.
 
         Returns:
-            Resolution dict with 'action', 'fact', 'requires_hitl'
+            {action, fact, requires_hitl, reason}: действие, выбранный
+            факт, нужен ли HITL и обоснование.
         """
         existing_time = self._parse_time(existing_fact.get("created_at"))
         new_time = self._parse_time(new_fact.get("created_at"))
@@ -102,7 +116,12 @@ class ConflictResolverAgent:
         existing_fact: dict[str, Any],
         new_fact: dict[str, Any],
     ) -> dict[str, Any]:
-        """Resolve by weight when timestamps unavailable."""
+        """Разрешить по весу, когда время недоступно.
+
+        Почему вес: при отсутствии created_at нет объективного критерия
+        свежести, и единственный доступный сигнал важности — weight,
+        заданный на этапе извлечения фактов.
+        """
         existing_weight = existing_fact.get("weight", 0.5)
         new_weight = new_fact.get("weight", 0.5)
 
@@ -122,7 +141,13 @@ class ConflictResolverAgent:
             }
 
     def _parse_time(self, value: Any) -> datetime | None:
-        """Parse datetime from various formats."""
+        """Разобрать время из различных форматов.
+
+        Почему принимает и datetime, и строку: факты приходят из
+        хранилища (datetime) и от внешних слоёв (ISO-строка); невалидное
+        значение не бросаем, а возвращаем None — далее сработает
+        резолюция по весу.
+        """
         if isinstance(value, datetime):
             return value
         if isinstance(value, str):

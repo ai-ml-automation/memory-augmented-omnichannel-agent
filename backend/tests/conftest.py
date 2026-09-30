@@ -1,9 +1,10 @@
 """
-Pytest Configuration
-Provides async SQLite fixtures for unit testing without PostgreSQL.
+Конфигурация pytest для юнит-тестов: async SQLite вместо PostgreSQL.
 
-SQLite does not support JSONB or PostgreSQL UUID types.
-This conftest registers dialect-level type compilers so Base.metadata.create_all works.
+Почему SQLite: юнит-тесты не требуют реальной БД — in-memory база быстрее
+и не зависит от окружения. PostgreSQL-типы JSONB/UUID компилируются
+в TEXT/VARCHAR(36) на диалекте SQLite, чтобы Base.metadata.create_all
+работал без изменений моделей.
 """
 
 import asyncio
@@ -26,13 +27,23 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 @compiles(PG_UUID, "sqlite")
 def compile_uuid_sqlite(type_, compiler, **kw):
-    """Map PostgreSQL UUID to VARCHAR(36) for SQLite."""
+    """
+    Компиляция PostgreSQL UUID → VARCHAR(36) для SQLite.
+
+    Нужна, чтобы модели с UUID-полями создавались в тестовой
+    in-memory базе без подключения к PostgreSQL.
+    """
     return "VARCHAR(36)"
 
 
 @compiles(PG_JSONB, "sqlite")
 def compile_jsonb_sqlite(type_, compiler, **kw):
-    """Map PostgreSQL JSONB to TEXT for SQLite."""
+    """
+    Компиляция PostgreSQL JSONB → TEXT для SQLite.
+
+    SQLite не хранит JSONB; TEXT достаточно для тестов, проверяющих
+    сериализацию и чтение JSON-полей моделей.
+    """
     return "TEXT"
 
 
@@ -40,7 +51,12 @@ def compile_jsonb_sqlite(type_, compiler, **kw):
 
 @pytest.fixture(scope="session")
 def event_loop():
-    """Create event loop for all tests."""
+    """
+    Event loop на всю тестовую сессию.
+
+    Позволяет pytest-asyncio выполнять async-тесты на одном loop
+    (быстрее, чем пересоздание на каждый тест); закрывается в конце.
+    """
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
@@ -48,7 +64,13 @@ def event_loop():
 
 @pytest_asyncio.fixture(scope="function")
 async def db_engine():
-    """Create async engine for tests."""
+    """
+    Async-движок SQLite in-memory, создаётся на каждый тест.
+
+    Почему function-scope: изоляция — каждый тест получает чистую схему
+    (create_all → teardown drop_all), данные между тестами не «протекают».
+    PRAGMA foreign_keys=ON включает проверку внешних ключей (каскады RTBF).
+    """
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)
 
     @event.listens_for(engine.sync_engine, "connect")
@@ -71,7 +93,13 @@ async def db_engine():
 
 @pytest_asyncio.fixture(scope="function")
 async def db_session(db_engine) -> AsyncGenerator[AsyncSession, None]:
-    """Create async session for tests."""
+    """
+    Async-сессия SQLAlchemy для теста.
+
+    Обёртка над db_engine: rollback в конце гарантирует, что
+    незакоммиченные изменения не утекут в следующий тест.
+    expire_on_commit=False оставляет объекты доступными после commit.
+    """
     session_factory = async_sessionmaker(
         bind=db_engine,
         class_=AsyncSession,

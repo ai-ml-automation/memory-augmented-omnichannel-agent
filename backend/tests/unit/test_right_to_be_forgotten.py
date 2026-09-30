@@ -1,6 +1,9 @@
 """
-Unit Tests for RightToBeForgottenService
-Tests cascade deletion across PostgreSQL, Qdrant, and Neo4j (B.3.1).
+Юнит-тесты RightToBeForgottenService (фаза B.3.1).
+
+Проверяют каскадное удаление данных пользователя: сводку по трём хранилищам
+(PostgreSQL, Qdrant, Neo4j), вызовы db.delete, пустые списки фактов и
+отключённую память (ENABLE_MEMORY=False) без обращения к векторным хранилищам.
 """
 
 import uuid
@@ -13,19 +16,34 @@ from backend.src.models import Fact, User
 
 @pytest.fixture
 def mock_db() -> AsyncMock:
-    """Mock async database session."""
+    """Мок асинхронной сессии БД.
+
+    Заменяет реальную сессию SQLAlchemy: execute/delete записываются в
+    вызовы, что позволяет проверять порядок и число обращений к БД.
+    """
     return AsyncMock()
 
 
 @pytest.fixture
 def sample_user_id() -> uuid.UUID:
-    """Stable UUID for tests."""
+    """Стабильный UUID пользователя для тестов.
+
+    Один UUID на тест держит согласованность: факты и пользователь
+    привязаны к одному id, иначе сводка удаления была бы бессмысленна.
+    """
     return uuid.uuid4()
 
 
 @pytest.fixture
 def sample_facts(sample_user_id: uuid.UUID) -> list[MagicMock]:
-    """Two mock Fact objects."""
+    """Два мок-объекта Fact, привязанных к sample_user_id.
+
+    Args:
+        sample_user_id: UUID, который присваивается fact.user_id.
+
+    Returns:
+        Список из двух MagicMock со spec=Fact и полем user_id.
+    """
     facts = []
     for _ in range(2):
         fact = MagicMock(spec=Fact)
@@ -37,7 +55,14 @@ def sample_facts(sample_user_id: uuid.UUID) -> list[MagicMock]:
 
 @pytest.fixture
 def sample_user(sample_user_id: uuid.UUID) -> MagicMock:
-    """Mock User object."""
+    """Мок-объект User с заданным id.
+
+    Args:
+        sample_user_id: UUID, присваиваемый user.id.
+
+    Returns:
+        MagicMock со spec=User и полем id = sample_user_id.
+    """
     user = MagicMock(spec=User)
     user.id = sample_user_id
     return user
@@ -50,7 +75,11 @@ async def test_delete_user_data_returns_summary(
     sample_facts: list[MagicMock],
     sample_user: MagicMock,
 ):
-    """Summary dict has correct counts for all stores."""
+    """Сводка удаления содержит корректные счётчики всех трёх хранилищ.
+
+    Ловит баг: неверный подсчёт в сводке — фронтенд показывает пользователю
+    ложное число удалённых фактов, нарушая прозрачность RTBF.
+    """
     with patch(
         "backend.src.config.get_settings"
     ):
@@ -89,7 +118,11 @@ async def test_delete_user_data_deletes_facts_from_pg(
     sample_facts: list[MagicMock],
     sample_user: MagicMock,
 ):
-    """db.delete is called for 2 facts + 1 user = 3 times."""
+    """db.delete вызывается для 2 фактов + 1 пользователя = 3 раза.
+
+    Ловит баг: пропуск удаления фактов или пользователя — данные частично
+    остаются в PostgreSQL после RTBF-запроса.
+    """
     with patch(
         "backend.src.config.get_settings"
     ):
@@ -122,7 +155,11 @@ async def test_delete_user_data_no_facts(
     sample_user_id: uuid.UUID,
     sample_user: MagicMock,
 ):
-    """Empty facts list - user still deleted, 0 facts in summary."""
+    """Пустой список фактов: пользователь удаляется, в сводке 0 фактов.
+
+    Ловит баг: краш на пустом списке или ошибочная запись «удалённые факты»
+    при их отсутствии — RTBF не должен падать на пользователе без фактов.
+    """
     with patch(
         "backend.src.config.get_settings"
     ):
@@ -154,7 +191,11 @@ async def test_delete_user_data_no_facts(
 
 @pytest.mark.asyncio
 async def test_returns_zero_when_empty_qdrant():
-    """Empty fact_ids list returns 0 without touching Qdrant."""
+    """Пустой список id возвращает 0 без обращения к Qdrant.
+
+    Ловит баг: лишний сетевой запрос к Qdrant при пустом списке —
+    пустое удаление не должно ходить в хранилище.
+    """
     with patch(
         "backend.src.config.get_settings"
     ):
@@ -169,7 +210,11 @@ async def test_returns_zero_when_empty_qdrant():
 
 @pytest.mark.asyncio
 async def test_skips_when_memory_disabled_qdrant():
-    """ENABLE_MEMORY=False causes Qdrant deletion to return 0."""
+    """При ENABLE_MEMORY=False удаление из Qdrant возвращает 0.
+
+    Ловит баг: попытка обратиться к Qdrant при отключённой памяти —
+    падение сервиса на окружении без векторного хранилища.
+    """
     mock_settings = MagicMock()
     mock_settings.ENABLE_MEMORY = False
 
@@ -189,7 +234,11 @@ async def test_skips_when_memory_disabled_qdrant():
 
 @pytest.mark.asyncio
 async def test_returns_zero_when_empty_neo4j():
-    """Empty fact_ids list returns 0 without touching Neo4j."""
+    """Пустой список id возвращает 0 без обращения к Neo4j.
+
+    Ловит баг: лишний сетевой запрос к Neo4j при пустом списке —
+    пустое удаление не должно ходить в графовое хранилище.
+    """
     with patch(
         "backend.src.config.get_settings"
     ):
@@ -204,7 +253,11 @@ async def test_returns_zero_when_empty_neo4j():
 
 @pytest.mark.asyncio
 async def test_skips_when_memory_disabled_neo4j():
-    """ENABLE_MEMORY=False causes Neo4j deletion to return 0."""
+    """При ENABLE_MEMORY=False удаление из Neo4j возвращает 0.
+
+    Ловит баг: попытка обратиться к Neo4j при отключённой памяти —
+    падение сервиса на окружении без графового хранилища.
+    """
     mock_settings = MagicMock()
     mock_settings.ENABLE_MEMORY = False
 

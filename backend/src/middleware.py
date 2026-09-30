@@ -1,6 +1,15 @@
 """
-JWT Middleware
-Automatic JWT validation for protected routes
+JWT-middleware: автоматическая валидация токена для защищённых маршрутов.
+
+Реализовано как middleware (а не per-route `Depends`), потому что
+защищать нужно ВСЕ маршруты по умолчанию, кроме явного списка публичных
+(`PUBLIC_ENDPOINTS`) и вебхуков (`WEBHOOK_PREFIXES`) — новый роутер
+оказывается защищённым без дополнительных действий.
+
+Здесь проверяется только формат и срок действия JWT (нет доступа к БД);
+полная загрузка пользователя выполняется в обработчиках через
+`get_current_admin` (см. `backend.src.dependencies`). CORS настраивается
+отдельно в `backend.src.main`.
 """
 
 from typing import Callable
@@ -13,7 +22,7 @@ from backend.src.config import get_settings
 
 settings = get_settings()
 
-# Public endpoints that don't require authentication
+# Публичные эндпоинты, не требующие аутентификации
 PUBLIC_ENDPOINTS = {
     "/",
     "/health",
@@ -24,36 +33,41 @@ PUBLIC_ENDPOINTS = {
     "/auth/register",
 }
 
-# Webhook endpoints that don't require authentication
+# Вебхуки не требуют JWT — подпись проверяется в обработчиках webhooks
 WEBHOOK_PREFIXES = {"/webhook/"}
 
 
 class JWTMiddleware(BaseHTTPMiddleware):
-    """Middleware for JWT validation on protected routes."""
+    """
+    Middleware валидации JWT на защищённых маршрутах.
+
+    Жизненный цикл: регистрируется в `main.py`, обрабатывает каждый
+    запрос до роутера. `BaseHTTPMiddleware` даёт перехват на уровне
+    приложения; сессии БД нет — проверяется подпись и срок токена.
+    """
 
     async def dispatch(
         self, request: Request, call_next: Callable
     ) -> Response:
         """
-        Process request through JWT middleware.
-
+        Обработка запроса: публичные пути и вебхуки пропускаются,
+        иначе cookie access_token: нет/невалиден/истёк → 401.
         Args:
-            request: Incoming request
-            call_next: Next middleware/endpoint handler
-
+            request: входящий запрос
+            call_next: следующий middleware/обработчик
         Returns:
-            Response from next handler or 401/403 error
+            Response от следующего обработчика либо JSON 401
         """
-        # Skip JWT validation for public endpoints
+        # Пропустить проверку JWT для публичных эндпоинтов
         path = request.url.path
         if path in PUBLIC_ENDPOINTS or path.startswith("/docs"):
             return await call_next(request)
 
-        # Skip JWT validation for webhook endpoints
+        # Пропустить проверку JWT для вебхуков
         if any(path.startswith(prefix) for prefix in WEBHOOK_PREFIXES):
             return await call_next(request)
 
-        # Skip if no cookie
+        # Нет cookie — сразу 401, не тратим время на декодирование
         token = request.cookies.get("access_token")
         if not token:
             return JSONResponse(
@@ -61,10 +75,10 @@ class JWTMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Not authenticated"},
             )
 
-        # Validate token
+        # Проверка подписи и срока действия токена
         try:
-            # Note: We don't have db session here, so we just validate the token format
-            # The actual user lookup happens in route handlers
+            # Сессии БД здесь нет — проверяем только формат/подпись JWT
+            # Полная загрузка пользователя — в обработчиках (get_current_admin)
             import jwt
 
             payload = jwt.decode(
@@ -73,7 +87,7 @@ class JWTMiddleware(BaseHTTPMiddleware):
                 algorithms=[settings.JWT_ALGORITHM],
             )
 
-            # Check expiration
+            # Проверка срока действия (exp)
             from datetime import datetime
 
             exp = payload.get("exp")
@@ -89,6 +103,6 @@ class JWTMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Invalid token"},
             )
 
-        # Continue to next handler
+        # Токен валиден — передать запрос дальше
         response = await call_next(request)
         return response

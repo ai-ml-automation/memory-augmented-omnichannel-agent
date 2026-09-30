@@ -1,7 +1,16 @@
 """
-Celery tasks for fact extraction and processing.
+Фоновая задача извлечения фактов из сообщений (III.4).
 
-III.4: Uses FactExtractorAgent (LLM-based) instead of keyword heuristics.
+Запускается из вебхуков в фоне: LLM-извлечение фактов — операция медленная
+и дорогая, её нельзя выполнять в HTTP-обработчике. В отличие от keyword-эвристик,
+FactExtractorAgent понимает контекст и возвращает структурированные факты
+с типом и весом.
+
+Ключевые решения:
+- LLM-извлечение вместо эвристик — III.4: качество фактов, фильтр эмоций;
+- анонимизация PII и фильтр эмоций выполняются до записи — 152-ФЗ;
+- хранение по одному факту в цикле: сбой одного факта не теряет остальные
+  (warning в лог, обработка продолжается).
 """
 
 import logging
@@ -25,20 +34,23 @@ def extract_facts(
     channel: str,
 ) -> dict:
     """
-    Async task: extract facts from a message using LLM and store them.
+    LLM-извлечение фактов из сообщения и их сохранение в память.
 
-    III.4: Uses FactExtractorAgent (LLM-based extraction) instead of
-    keyword heuristics. Pipeline: LLM extract -> filter emotions -> anonymize PII.
+    Почему задача: вебхук отвечает 200 сразу, а цепочка «LLM-извлечение → фильтр
+    эмоций → анонимизация PII → запись» занимает секунды. Факты сохраняются
+    по одному — частичный сбой одного факта не прерывает обработку остальных.
 
-    Dispatched from webhooks for background processing.
+    Ретраи: max_retries=3 с паузой 60 с — LLM-провайдеры (YandexGPT/vLLM/GigaChat)
+    подвержены транзиентным таймаутам; после исчерпания попыток исключение
+    уходит в Celery. Повторный запуск безопасен: дубликаты отсекаются хранилищем.
 
     Args:
-        user_id: User ID string
-        message: User message text
-        channel: Channel type (TG, VK, MAX, VOICE)
+        user_id: идентификатор пользователя (строка, конвертируется в UUID)
+        message: текст сообщения для извлечения фактов
+        channel: тип канала (TG, VK, MAX, VOICE) — сохраняется с каждым фактом
 
     Returns:
-        Result dict with facts_stored count and extracted facts
+        dict: ``facts_stored`` — сколько фактов записано, ``facts`` — извлечённые факты
     """
     import asyncio
     from backend.src.database import async_session_factory

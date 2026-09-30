@@ -1,9 +1,15 @@
 """
-Memory Manager Agent
-Thin business-logic layer over MemoryService (Phase D.2.3).
+Агент управления памятью в диалоге (этап D.2.3).
 
-store_facts: delegates to MemoryService (PG+Qdrant+Neo4j)
-retrieve_facts: delegates to MemoryService.search_facts()
+Назначение: тонкий бизнес-слой поверх MemoryService (PG+Qdrant+Neo4j).
+Почему тонкий: вся логика хранения/поиска сосредоточена в сервисе,
+а агент отвечает за контракт диалога — какой формат факта принимается,
+что вернуть вызывающему и как не потерять ошибку сохранения.
+Почему через внедрённый сервис (DI): агент не создаёт соединения сам,
+тестируется с фейковым сервисом без БД и векторного индекса.
+
+store_facts: делегирует MemoryService.store_fact() по одному факту.
+retrieve_facts: делегирует MemoryService.search_facts().
 """
 
 import logging
@@ -17,8 +23,12 @@ logger = logging.getLogger(__name__)
 
 class MemoryManagerAgent:
     """
-    Agent for managing memory operations.
-    Delegates all storage to MemoryService via DI.
+    Агент управления памятью (D.2.3).
+
+    Делегирует все операции внедрённому MemoryService (DI): агент не
+    создаёт подключения и не знает о конкретных хранилищах — это
+    позволяет подменять сервис в тестах и менять слой памяти без
+    правок в диалоговом коде.
     """
 
     def __init__(self, memory_service: MemoryService) -> None:
@@ -31,15 +41,21 @@ class MemoryManagerAgent:
         channel: str = "text",
     ) -> list[dict[str, Any]]:
         """
-        Store facts via the injected MemoryService.
+        Сохранить факты через внедрённый MemoryService.
+
+        Почему по одному, а не батчем: сервис хранит факт в нескольких
+        хранилищах (PG/Qdrant/Neo4j), и при сбое на одном факте нужно
+        сохранить остальные — батч уронил бы всё разом. Пустое содержимое
+        пропускаем: факт без текста бесполезен и засорит индекс.
 
         Args:
-            user_id: User identifier
-            facts: List of fact dicts with type, content, weight
-            channel: Channel type
+            user_id: Идентификатор пользователя.
+            facts: Список фактов {type, content, weight}.
+            channel: Тип канала (text/telegram/vk/max).
 
         Returns:
-            List of stored fact results
+            Результаты по каждому факту: {id, type, content, weight,
+            status} при успехе либо {type, content, error} при сбое.
         """
         stored: list[dict[str, Any]] = []
 
@@ -83,15 +99,16 @@ class MemoryManagerAgent:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """
-        Retrieve facts via the injected MemoryService.
+        Получить факты через внедрённый MemoryService.
 
         Args:
-            user_id: User identifier
-            query: Search query
-            limit: Maximum results
+            user_id: Идентификатор пользователя.
+            query: Поисковый запрос.
+            limit: Максимум результатов.
 
         Returns:
-            List of facts
+            Список фактов {id, type, content, weight, source} —
+            единая схема для диалогового слоя независимо от хранилища.
         """
         results = await self.memory_service.search_facts(
             user_id, query, limit

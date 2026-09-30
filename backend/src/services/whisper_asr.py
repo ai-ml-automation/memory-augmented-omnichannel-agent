@@ -1,7 +1,15 @@
 """
-Whisper ASR Service
-OpenAI Whisper for speech-to-text (Phase D.3.1).
-Lazy initialization — model loaded only on first use.
+Распознавание речи локальной моделью OpenAI Whisper (Phase D.3.1).
+
+Почему локальная модель, а не облачный API: аудио с персональными данными
+не покидает сервер (152-ФЗ), нет зависимости от сети и внешнего провайдера.
+
+Ключевые решения:
+- модель загружается лениво при первом распознавании — старт приложения без
+  тяжёлого ML-стека (модель объёмом сотни МБ);
+- Whisper синхронный и долгий — вызов выполняется в executor, чтобы не
+  блокировать event loop;
+- аудио пишется во временный файл: Whisper принимает путь, а не байты.
 """
 
 import logging
@@ -17,15 +25,36 @@ settings = get_settings()
 
 class WhisperASR:
     """
-    Whisper-based ASR with lazy initialization.
-    Phase D.3.1: Model loaded only on first process_audio call.
+    Распознавание речи на базе Whisper с ленивой загрузкой модели.
+
+    Жизненный цикл: лёгкий объект; модель whisper.load_model создаётся при
+    первом transcribe и переиспользуется (слот _model).
+
+    Почему переиспользование: загрузка модели — самая дорогая операция
+    (секунды и сотни МБ памяти), повторная загрузка на каждый запрос
+    сделала бы голосовой сценарий непригодным для реального использования.
     """
 
     def __init__(self):
+        """
+        Пустой сервис: модель не загружается при создании.
+
+        Слот _model заполняется лениво в _get_model; конструктор не требует
+        установленного whisper и не потребляет память модели.
+        """
         self._model = None
 
     def _get_model(self) -> Any:
-        """Lazy load Whisper model."""
+        """
+        Ленивая загрузка модели Whisper.
+
+        Модель (WHISPER_MODEL, по умолчанию "base") загружается один раз.
+        При ENABLE_ASR=false — RuntimeError без загрузки; при отсутствии
+        пакета openai-whisper — RuntimeError с инструкцией установки.
+
+        Returns:
+            загруженная модель whisper
+        """
         if self._model is None:
             if not settings.ENABLE_ASR:
                 raise RuntimeError("ASR disabled (ENABLE_ASR=false)")
@@ -51,14 +80,22 @@ class WhisperASR:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
-        Transcribe audio to text using Whisper.
+        Распознавание аудио в текст.
+
+        Аудио сохраняется во временный файл и удаляется в finally (аудио — это
+        персональные данные, следов на диске оставаться не должно). Синхронный
+        вызов модели выполняется в run_in_executor — транскрибация может занять
+        секунды и не должна блокировать обработку других запросов.
+
+        Достоверность (confidence) пересчитывается из среднего avg_logprob
+        сегментов в диапазон 0..1.
 
         Args:
-            audio_data: Audio bytes (WAV, MP3, etc.)
-            language: Language code (e.g., 'ru', 'en')
+            audio_data: аудио в байтах (WAV, MP3 и др.)
+            language: код языка ('ru', 'en')
 
         Returns:
-            Dict with text, success, confidence
+            dict: text, success, confidence, language; при ошибке — error
         """
         if not settings.ENABLE_ASR:
             return {

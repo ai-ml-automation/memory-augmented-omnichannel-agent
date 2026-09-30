@@ -1,6 +1,12 @@
 """
-Users Router
-Admin API for user management (requires admin role)
+Административный роутер управления пользователями.
+
+Доступ — только для роли admin (@see get_current_admin): просмотр списка,
+получение карточки, обновление роли/имени и удаление пользователя.
+
+Ключевое решение: удаление (`delete_user`) выполняет физическое удаление
+записи User — каскад по зависимым данным реализует процедура RTBF
+(right to be forgotten), см. `RightToBeForgottenService`.
 """
 
 import logging
@@ -21,7 +27,13 @@ router = APIRouter(prefix="/admin/users", tags=["admin-users"])
 
 
 class UserResponse(BaseModel):
-    """User response schema."""
+    """
+    Карточка пользователя для админ-панели.
+
+    Вместо номера телефона отдаётся только его HMAC-хеш (`phone_hash`) —
+    сырой номер не покидает сервис аутентификации (см. `AuthService`):
+    админу он не нужен, а раскрытие нарушило бы 152-ФЗ.
+    """
     id: uuid.UUID
     phone_hash: str
     full_name: str | None
@@ -30,7 +42,12 @@ class UserResponse(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """User update schema."""
+    """
+    Поля, допустимые для изменения администратором.
+
+    Оба поля опциональны: обновляются только переданные. Роль и имя
+    могут менять админы, но не сам пользователь (безопасность ролей).
+    """
     full_name: str | None = None
     role: str | None = None
 
@@ -43,14 +60,17 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ) -> list[UserResponse]:
     """
-    List all users.
+    Список пользователей с постраничной выдачей.
+
+    Ограничение `limit` (до 50 по умолчанию) защищает от выгрузки всей
+    базы пользователей одним запросом; пагинация — offset/limit.
 
     Args:
-        skip: Offset
-        limit: Maximum number of users
+        skip: смещение от начала выборки
+        limit: максимальное число записей на страницу
 
     Returns:
-        List of users
+        list[UserResponse]: карточки пользователей (без номеров телефонов)
     """
     result = await db.execute(
         select(User).offset(skip).limit(limit)
@@ -76,16 +96,17 @@ async def get_user(
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     """
-    Get user by ID.
+    Карточка пользователя по идентификатору.
 
     Args:
-        user_id: User identifier
+        user_id: UUID пользователя
 
     Returns:
-        User data
+        UserResponse: данные пользователя
 
     Raises:
-        404: User not found
+        HTTPException: 404, если пользователь не найден (не раскрываем
+            разницу между «нет пользователя» и «нет доступа»)
     """
     result = await db.execute(
         select(User).where(User.id == user_id)
@@ -112,17 +133,20 @@ async def update_user(
     db: AsyncSession = Depends(get_db),
 ) -> UserResponse:
     """
-    Update user.
+    Обновление имени и/или роли пользователя.
+
+    Меняются только переданные поля (`data` опционален), `flush()` отправляет
+    изменения в БД в рамках текущей транзакции — commit выполняет middleware.
 
     Args:
-        user_id: User identifier
-        data: Update data
+        user_id: UUID пользователя
+        data: новые значения full_name/role
 
     Returns:
-        Updated user
+        UserResponse: обновлённая карточка
 
     Raises:
-        404: User not found
+        HTTPException: 404, если пользователь не найден
     """
     result = await db.execute(
         select(User).where(User.id == user_id)
@@ -155,16 +179,20 @@ async def delete_user(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """
-    Delete user.
+    Удаление пользователя (право на забвение, 152-ФЗ).
+
+    Физически удаляет запись User; каскад по связанным данным (факты,
+    аудит, привязки каналов) — обязанность процедуры RTBF, которая
+    вызывается отдельно через консенсус-пайплайн, а не здесь.
 
     Args:
-        user_id: User identifier
+        user_id: UUID пользователя
 
     Returns:
-        Success message
+        {"status": "deleted"}
 
     Raises:
-        404: User not found
+        HTTPException: 404, если пользователь не найден
     """
     result = await db.execute(
         select(User).where(User.id == user_id)

@@ -1,7 +1,15 @@
 """
-Silero TTS Service
-Open-source text-to-speech using Silero models (Phase D.3.2).
-Lazy initialization — model loaded only on first use.
+Синтез речи открытой моделью Silero TTS (Phase D.3.2).
+
+Почему локальная модель: текст ответа может содержать персональные данные
+пользователя, поэтому он не должен отправляться в облачные TTS (152-ФЗ);
+Silero работает полностью на сервере.
+
+Ключевые решения:
+- модель загружается лениво (torch.hub.load) при первом синтезе;
+- синтез выполняется в executor — не блокирует event loop;
+- выходной тензор конвертируется в WAV-байты вручную (без внешних
+  аудио-библиотек).
 """
 
 import logging
@@ -16,16 +24,36 @@ settings = get_settings()
 
 class SileroTTS:
     """
-    Silero-based TTS with lazy initialization.
-    Phase D.3.2: Model loaded only on first synthesize call.
+    Синтез речи на базе Silero с ленивой загрузкой модели.
+
+    Жизненный цикл: лёгкий объект; модель загружается при первом synthesize
+    и переиспользуется; reset() освобождает модель (память/GPU).
+
+    Почему Silero, а не облако: полностью локальная модель с русскими голосами,
+    отсутствие внешних вызовов — ключевое требование приватности (152-ФЗ).
     """
 
     def __init__(self):
+        """
+        Пустой сервис с фиксированной частотой дискретизации.
+
+        Модель загружается лениво; _sample_rate=24000 используется и для
+        синтеза (Silero выводит 24 кГц), и для заголовка WAV-файла.
+        """
         self._model = None
         self._sample_rate = 24000
 
     def _get_model(self) -> Any:
-        """Lazy load Silero TTS model."""
+        """
+        Ленивая загрузка модели Silero TTS.
+
+        Модель загружается через torch.hub из репозитория snakers4/silero-models
+        (русская версия). ENABLE_TTS=false → RuntimeError; отсутствие torch —
+        RuntimeError; сбой загрузки модели — RuntimeError с причиной.
+
+        Returns:
+            загруженная модель Silero TTS
+        """
         if self._model is None:
             if not settings.ENABLE_TTS:
                 raise RuntimeError("TTS disabled (ENABLE_TTS=false)")
@@ -59,15 +87,20 @@ class SileroTTS:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """
-        Synthesize text to speech using Silero.
+        Синтез речи: текст → WAV-аудио.
+
+        Синхронный вызов модели (может занимать заметное время) выполняется
+        в executor. Включены put_accent и put_yo — корректная расстановка
+        ударений и буквы ё для естественного русского звучания.
 
         Args:
-            text: Text to speak
-            voice: Voice ID (ru_0, ru_1, ..., ru_4)
-            speed: Speech speed (0.5 - 2.0)
+            text: текст для озвучивания
+            voice: идентификатор голоса (ru_0 ... ru_4)
+            speed: скорость речи (0.5–2.0)
 
         Returns:
-            Dict with audio bytes, sample_rate, success
+            dict: audio (WAV-байты), success, sample_rate, duration;
+                при ошибке — audio=None и error
         """
         if not settings.ENABLE_TTS:
             return {
@@ -112,7 +145,19 @@ class SileroTTS:
             }
 
     def _tensor_to_wav(self, audio_tensor: Any) -> bytes:
-        """Convert PyTorch tensor to WAV bytes."""
+        """
+        Конвертация тензора PyTorch в WAV-байты (16-bit PCM).
+
+        WAV-заголовок (RIFF/fmt/data) собирается вручную через struct.pack —
+        это исключает зависимость от аудио-библиотек. Тензор нормализуется
+        к максимальной амплитуде int16 перед записью.
+
+        Args:
+            audio_tensor: тензор аудио (float32, 1 канал)
+
+        Returns:
+            bytes: WAV-файл с частотой _sample_rate
+        """
         import struct
 
         # Normalize to 16-bit PCM
@@ -152,7 +197,13 @@ class SileroTTS:
         return buf.getvalue()
 
     def reset(self) -> None:
-        """Reset model (release memory)."""
+        """
+        Сброс модели для освобождения памяти.
+
+        Удаляет ссылку на модель (del + None), позволяя сборщику мусора
+        освободить память CPU/GPU. Нужен при длительных простоях голосового
+        сценария или в тестах для очистки состояния.
+        """
         if self._model is not None:
             del self._model
             self._model = None

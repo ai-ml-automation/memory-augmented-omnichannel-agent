@@ -1,14 +1,16 @@
 ﻿"""
-Webhooks Router
-Unified endpoint for all messenger webhooks
+Единая точка приёма вебхуков от мессенджеров (Telegram, VK, MAX).
 
-Security (Phase B.2):
-- Telegram: X-Telegram-Bot-Api-Secret-Token header verification
-- VK: secret parameter verification in callback data
+Зачем единый роутер: все каналы омниканального шлюза обрабатываются одним
+конвейером `process_message` (Celery), поэтому эндпоинты возвращают 200 OK
+немедленно, а реальная обработка уходит в фон (Phase C.2, fire-and-forget).
 
-Async (Phase C.2):
-- Messages processed via Celery tasks (fire-and-forget)
-- Webhook returns 200 OK immediately
+Безопасность (Phase B.2):
+- Telegram: проверка заголовка X-Telegram-Bot-Api-Secret-Token через compare_digest;
+- VK: проверка поля secret в данных Callback API;
+- MAX: подпись не предусмотрена провайдером, верификация не выполняется.
+
+В dev-режиме (секрет не задан в настройках) проверка пропускается — см. @see get_settings.
 """
 
 import hmac
@@ -41,12 +43,17 @@ vk_gateway = VKGateway()
 
 def _verify_telegram_secret(request: Request) -> None:
     """
-    Verify X-Telegram-Bot-Api-Secret-Token header.
+    Проверка заголовка X-Telegram-Bot-Api-Secret-Token от Telegram.
 
-    Telegram sends this header on every webhook call when the
-    secret token is set via setWebhook(secret_token=...).
+    Telegram присылает этот заголовок на каждый вызов, если секрет задан
+    при регистрации вебхука (setWebhook). Сравнение через hmac.compare_digest
+    исключает timing-атаку по длине секрета.
 
-    Raises 403 if the token is missing or does not match.
+    Если секрет не сконфигурирован — проверка пропускается (dev-режим),
+    в проде секрет обязателен (Phase B.2.1).
+
+    Raises:
+        HTTPException: 403, если заголовок отсутствует или не совпадает
     """
     if not settings.TELEGRAM_WEBHOOK_SECRET:
         # Secret not configured - skip verification (dev mode)
@@ -70,12 +77,16 @@ def _verify_telegram_secret(request: Request) -> None:
 
 def _verify_vk_secret(data: dict) -> None:
     """
-    Verify VK Callback API secret parameter.
+    Проверка поля secret в данных VK Callback API.
 
-    VK sends 'secret' field in every callback if configured in
-    the group settings.
+    VK добавляет это поле в каждый callback, если оно задано в настройках
+    сообщества. Сравнение через hmac.compare_digest — защита от timing-атак.
 
-    Raises 403 if the secret does not match.
+    Подводный камень: confirmation-запрос приходит БЕЗ поля secret — его
+    обрабатывает `vk_webhook` до вызова этой функции.
+
+    Raises:
+        HTTPException: 403, если секрет не совпадает
     """
     if not settings.VK_CALLBACK_SECRET:
         # Secret not configured - skip verification (dev mode)
@@ -99,10 +110,22 @@ async def max_webhook(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """
-    Handle MAX webhook.
+    Приём сообщений из мессенджера MAX.
 
-    Receives messages from MAX messenger and processes them async.
-    C.2.3: Returns 200 OK immediately, processes in background via Celery.
+    Почему асинхронно: обработка (идентификация, память, ответ) занимает
+    секунды — держать HTTP-соединение мессенджера недопустимо, поэтому
+    сообщение передаётся в Celery-задачу `process_message` и эндпоинт
+    сразу возвращает 200 OK (Phase C.2.3).
+
+    Args:
+        request: исходный HTTP-запрос с JSON-данными вебхука
+        db: сессия БД (передаётся в фоновую задачу)
+
+    Returns:
+        {"status": "ok"} — подтверждение приёма
+
+    Raises:
+        HTTPException: 400 при невалидных данных, 500 при внутренней ошибке
     """
     try:
         data = await request.json()
@@ -132,11 +155,23 @@ async def telegram_webhook(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """
-    Handle Telegram webhook.
+    Приём сообщений из Telegram.
 
-    Receives messages from Telegram and processes them async.
-    B.2.1: Verifies X-Telegram-Bot-Api-Secret-Token header.
-    C.2.3: Returns 200 OK immediately, processes in background via Celery.
+    Перед обработкой вызывается проверка секрета (Phase B.2.1): без неё
+    любой может слать сообщения от имени бота и засорять память клиентов.
+
+    Данные передаются в Celery-задачу `process_message` (fire-and-forget),
+    ответ 200 OK возвращается сразу (Phase C.2.3).
+
+    Args:
+        request: исходный HTTP-запрос с JSON-данными вебхука
+        db: сессия БД (передаётся в фоновую задачу)
+
+    Returns:
+        {"status": "ok"} — подтверждение приёма
+
+    Raises:
+        HTTPException: 403 при неверном секрете, 400/500 при ошибках данных
     """
     _verify_telegram_secret(request)
 
@@ -168,11 +203,24 @@ async def vk_webhook(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """
-    Handle VK webhook (Callback API).
+    Приём сообщений из VK (Callback API).
 
-    Receives messages from VK and processes them async.
-    B.2.2: Verifies VK 'secret' parameter.
-    C.2.3: Returns 200 OK immediately, processes in background via Celery.
+    Особенность VK: запрос confirmation (подтверждение адреса сервера)
+    обрабатывается ДО проверки секрета и возвращает идентификатор группы —
+    иначе VK не завершит регистрацию вебхука.
+
+    Обычные сообщения проходят проверку секрета (Phase B.2.2), затем
+    уходят в Celery-задачу `process_message`, ответ — 200 OK (Phase C.2.3).
+
+    Args:
+        request: исходный HTTP-запрос с JSON-данными вебхука
+        db: сессия БД (передаётся в фоновую задачу)
+
+    Returns:
+        {"status": "ok"} или {"response": VK_GROUP_ID} для confirmation
+
+    Raises:
+        HTTPException: 403 при неверном секрете, 400/500 при ошибках данных
     """
     try:
         data = await request.json()
@@ -211,11 +259,21 @@ async def unified_webhook(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, str]:
     """
-    Unified webhook endpoint.
+    Универсальный эндпоинт вебхуков для произвольного канала.
 
-    Accepts messages from any channel and routes them async.
-    Applies per-channel secret verification.
-    C.2.3: Returns 200 OK immediately, processes in background via Celery.
+    Позволяет подключать новые каналы без отдельного эндпоинта: маршрутизация
+    по полю channel (TG/VK/MAX) с соответствующей проверкой секрета на месте.
+    Используется для интеграционных тестов и каналов без собственного роутера.
+
+    Args:
+        request: исходный HTTP-запрос с JSON-данными вебхука
+        db: сессия БД (передаётся в фоновую задачу)
+
+    Returns:
+        {"status": "ok"} — подтверждение приёма
+
+    Raises:
+        HTTPException: 400 при неизвестном канале или невалидных данных
     """
     try:
         data = await request.json()
